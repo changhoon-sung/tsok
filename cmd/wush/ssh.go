@@ -66,7 +66,9 @@ func sshCmd() *serpent.Command {
 			}
 
 			logf("Bringing WireGuard up..")
-			ts.Up(ctx)
+			if _, err := ts.Up(ctx); err != nil {
+				return fmt.Errorf("bring wireguard up: %w", err)
+			}
 			logf("WireGuard is ready!")
 
 			lc, err := ts.LocalClient()
@@ -98,7 +100,7 @@ func sshCmd() *serpent.Command {
 			},
 			{
 				Flag:        "derp-config-file",
-				Description: "File which specifies the DERP config to use. In the structure of https://pkg.go.dev/tailscale.com@v1.74.1/tailcfg#DERPMap.",
+				Description: "File which specifies the DERP config to use. In the structure of https://pkg.go.dev/tailscale.com/tailcfg#DERPMap.",
 				Default:     "",
 				Value:       serpent.StringOf(&derpmapFi),
 			},
@@ -140,7 +142,7 @@ func waitUntilHasPeerHasIP(ctx context.Context, logF func(str string, args ...an
 
 		stat, err := lc.Status(ctx)
 		if err != nil {
-			fmt.Println("error getting lc status:", err)
+			logF("error getting local status: %s", err)
 			continue
 		}
 
@@ -189,6 +191,10 @@ func waitUntilHasP2P(ctx context.Context, logF func(str string, args ...any), lc
 		}
 
 		peers := stat.Peers()
+		if len(peers) == 0 {
+			logF("No peer yet")
+			continue
+		}
 		peer, ok := stat.Peer[peers[0]]
 		if !ok {
 			logF("no peer found in map while waiting p2p (developer error)")

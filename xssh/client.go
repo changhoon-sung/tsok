@@ -15,10 +15,14 @@ import (
 )
 
 func TailnetSSH(ctx context.Context, inv *serpent.Invocation, ts *tsnet.Server, addr string, stdio bool) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
 	conn, err := ts.Dial(ctx, "tcp", addr)
 	if err != nil {
 		return err
 	}
+	defer conn.Close()
 
 	// if stdio {
 	// 	gnConn, ok := conn.(*gonet.TCPConn)
@@ -35,17 +39,19 @@ func TailnetSSH(ctx context.Context, inv *serpent.Invocation, ts *tsnet.Server, 
 	}
 
 	sshClient := ssh.NewClient(sshConn, channels, requests)
+	defer sshClient.Close()
 	sshSession, err := sshClient.NewSession()
 	if err != nil {
 		return err
 	}
+	defer sshSession.Close()
 
 	sshSession.Stdin = inv.Stdin
 	sshSession.Stdout = inv.Stdout
 	sshSession.Stderr = inv.Stderr
 
-	if len(inv.Args) > 1 {
-		return sshSession.Run(strings.Join(inv.Args, " "))
+	if command, ok := remoteCommand(inv.Args); ok {
+		return sshSession.Run(command)
 	}
 
 	stdinFile, validIn := inv.Stdin.(*os.File)
@@ -102,4 +108,11 @@ func TailnetSSH(ctx context.Context, inv *serpent.Invocation, ts *tsnet.Server, 
 	}
 
 	return sshSession.Wait()
+}
+
+func remoteCommand(args []string) (string, bool) {
+	if len(args) == 0 {
+		return "", false
+	}
+	return strings.Join(args, " "), true
 }

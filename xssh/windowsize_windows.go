@@ -10,7 +10,7 @@ import (
 )
 
 func ListenWindowSize(ctx context.Context) <-chan os.Signal {
-	windowSize := make(chan os.Signal, 3)
+	windowSize := make(chan os.Signal, 1)
 	ticker := time.NewTicker(time.Second)
 	go func() {
 		defer ticker.Stop()
@@ -20,7 +20,11 @@ func ListenWindowSize(ctx context.Context) <-chan os.Signal {
 				return
 			case <-ticker.C:
 			}
-			windowSize <- nil
+			select {
+			case <-ctx.Done():
+				return
+			case windowSize <- nil:
+			}
 		}
 	}()
 	return windowSize

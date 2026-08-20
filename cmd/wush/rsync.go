@@ -55,19 +55,20 @@ func rsyncCmd() *serpent.Command {
 			overlayOpts.clientAuth.PrintDebug(logf, dm)
 
 			progPath := os.Args[0]
-			args := []string{
-				"-c",
-				fmt.Sprintf(`rsync -e "%s ssh --auth-key %s --quiet --" %s`,
-					progPath, overlayOpts.clientAuth.AuthKey(), strings.Join(inv.Args, " "),
-				),
-			}
-			fmt.Println("Running rsync", strings.Join(inv.Args, " "))
-			cmd := exec.CommandContext(ctx, "sh", args...)
+			args := buildRsyncArgs(progPath, inv.Args, overlayOpts, verbose)
+			_, _ = fmt.Fprintf(inv.Stderr, "Running rsync %q\n", inv.Args)
+			cmd := exec.CommandContext(ctx, "rsync", args...)
+			// The nested `wush ssh` process inherits this without exposing the
+			// auth key in either rsync's or wush's command-line arguments.
+			cmd.Env = append(cmd.Environ(), "WUSH_AUTH_KEY="+overlayOpts.clientAuth.AuthKey())
 			cmd.Stdin = inv.Stdin
 			cmd.Stdout = inv.Stdout
 			cmd.Stderr = inv.Stderr
 
-			return cmd.Run()
+			if err := cmd.Run(); err != nil {
+				return fmt.Errorf("run rsync: %w", err)
+			}
+			return nil
 		},
 		Options: []serpent.Option{
 			{
@@ -97,4 +98,31 @@ func rsyncCmd() *serpent.Command {
 			},
 		},
 	}
+}
+
+func buildRsyncArgs(progPath string, args []string, overlayOpts *sendOverlayOpts, verbose bool) []string {
+	remoteShell := []string{progPath, "ssh", "--quiet"}
+	if overlayOpts.stunAddrOverride != "" {
+		remoteShell = append(remoteShell, "--stun-ip-override", overlayOpts.stunAddrOverride)
+	}
+	if overlayOpts.waitP2P {
+		remoteShell = append(remoteShell, "--wait-p2p")
+	}
+	if verbose {
+		remoteShell = append(remoteShell, "--verbose")
+	}
+	remoteShell = append(remoteShell, "--")
+
+	quoted := make([]string, len(remoteShell))
+	for i, arg := range remoteShell {
+		quoted[i] = quoteShellArg(arg)
+	}
+
+	result := make([]string, 0, len(args)+2)
+	result = append(result, "-e", strings.Join(quoted, " "))
+	return append(result, args...)
+}
+
+func quoteShellArg(arg string) string {
+	return "'" + strings.ReplaceAll(arg, "'", `'"'"'`) + "'"
 }

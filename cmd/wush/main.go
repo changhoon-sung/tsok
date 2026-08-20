@@ -10,7 +10,6 @@ import (
 	"github.com/coder/pretty"
 	"github.com/coder/serpent"
 	"github.com/coder/wush/cliui"
-	"github.com/mitchellh/go-wordwrap"
 )
 
 func main() {
@@ -84,7 +83,6 @@ func formatExamples(examples ...example) string {
 	padStyle := cliui.DefaultStyles.Wrap.With(pretty.XPad(4, 0))
 	for i, e := range examples {
 		if len(e.Description) > 0 {
-			wordwrap.WrapString(e.Description, 80)
 			_, _ = sb.WriteString(
 				"  - " + pretty.Sprint(padStyle, e.Description+":")[4:] + "\n\n    ",
 			)

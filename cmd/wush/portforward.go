@@ -103,7 +103,9 @@ func portForwardCmd() *serpent.Command {
 			}
 
 			logf("Bringing WireGuard up..")
-			ts.Up(ctx)
+			if _, err := ts.Up(ctx); err != nil {
+				return fmt.Errorf("bring wireguard up: %w", err)
+			}
 			logf("WireGuard is ready!")
 
 			lc, err := ts.LocalClient()
@@ -183,7 +185,7 @@ func portForwardCmd() *serpent.Command {
 			},
 			{
 				Flag:        "derp-config-file",
-				Description: "File which specifies the DERP config to use. In the structure of https://pkg.go.dev/tailscale.com@v1.74.1/tailcfg#DERPMap.",
+				Description: "File which specifies the DERP config to use. In the structure of https://pkg.go.dev/tailscale.com/tailcfg#DERPMap.",
 				Default:     "",
 				Value:       serpent.StringOf(&derpmapFi),
 			},
@@ -441,8 +443,8 @@ func parsePortRange(in string) ([]uint16, error) {
 		return nil, xerrors.Errorf("range end port %v is less than start port %v", end, start)
 	}
 	var ports []uint16
-	for i := start; i <= end; i++ {
-		ports = append(ports, i)
+	for i := uint32(start); i <= uint32(end); i++ {
+		ports = append(ports, uint16(i))
 	}
 	return ports, nil
 }

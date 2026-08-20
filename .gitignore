@@ -1,13 +1,6 @@
 dist
 test
 
-main.wasm
 test.txt
-.next/
 .env
-site/wasm/*.js
-site/wasm/*.wasm
-site/node_modules/
 .env.local
-
-.vercel

@@ -6,21 +6,19 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
-	"net/http/httputil"
 	"net/netip"
 	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
-	"time"
 
 	"github.com/charmbracelet/huh"
 	"github.com/coder/serpent"
 	"github.com/coder/wush/cliui"
 	"github.com/coder/wush/overlay"
 	"github.com/coder/wush/tsserver"
-	"github.com/pion/webrtc/v4"
 	"github.com/schollz/progressbar/v3"
 	"tailscale.com/net/netns"
 	"tailscale.com/tailcfg"
@@ -80,6 +78,10 @@ func sendOverlayMW(opts *sendOverlayOpts, send **overlay.Send, logger *slog.Logg
 	return func(next serpent.HandlerFunc) serpent.HandlerFunc {
 		return func(i *serpent.Invocation) error {
 			var err error
+
+			if regionID := opts.clientAuth.ReceiverDERPRegionID; regionID != 0 && dm.Regions[int(regionID)] == nil {
+				return fmt.Errorf("auth key references unknown DERP region %d", regionID)
+			}
 
 			newSend := overlay.NewSendOverlay(logger, dm)
 			newSend.Auth = opts.clientAuth
@@ -158,6 +160,22 @@ func cpCmd() *serpent.Command {
 		),
 		Handler: func(inv *serpent.Invocation) error {
 			ctx := inv.Context()
+			fiPath := inv.Args[0]
+			fiName := filepath.Base(fiPath)
+
+			fi, err := os.Open(fiPath)
+			if err != nil {
+				return fmt.Errorf("open upload file: %w", err)
+			}
+			defer fi.Close()
+
+			fiStat, err := fi.Stat()
+			if err != nil {
+				return fmt.Errorf("stat upload file: %w", err)
+			}
+			if !fiStat.Mode().IsRegular() {
+				return fmt.Errorf("upload path %q is not a regular file", fiPath)
+			}
 
 			s, err := tsserver.NewServer(ctx, logger, send, dm)
 			if err != nil {
@@ -174,93 +192,6 @@ func cpCmd() *serpent.Command {
 
 			go s.ListenAndServe(ctx)
 
-			fiPath := inv.Args[0]
-			fiName := filepath.Base(inv.Args[0])
-
-			fi, err := os.Open(fiPath)
-			if err != nil {
-				return err
-			}
-			defer fi.Close()
-
-			fiStat, err := fi.Stat()
-			if err != nil {
-				return err
-			}
-
-			if send.Auth.Web {
-				meta := overlay.RtcMetadata{
-					Type: overlay.RtcMetadataTypeFileMetadata,
-					FileMetadata: overlay.RtcFileMetadata{
-						FileName: fiName,
-						FileSize: int(fiStat.Size()),
-					},
-				}
-
-				raw, err := json.Marshal(meta)
-				if err != nil {
-					panic(err)
-				}
-
-				logf("Waiting for data channel to open...")
-				for {
-					if send.RtcDc.ReadyState() == webrtc.DataChannelStateOpen {
-						break
-					}
-					time.Sleep(100 * time.Millisecond)
-				}
-				logf("Data channel is open!")
-
-				if err := send.RtcDc.SendText(string(raw)); err != nil {
-					panic(err)
-				}
-
-				bar := progressbar.DefaultBytes(
-					fiStat.Size(),
-					fmt.Sprintf("Uploading %q", fiPath),
-				)
-				barReader := progressbar.NewReader(fi, bar)
-
-				buf := make([]byte, 16384)
-
-				for {
-					n, err := barReader.Read(buf)
-					if err != nil && err != io.EOF {
-						return err
-					}
-
-					if n > 0 {
-						if err := send.RtcDc.Send(buf[:n]); err != nil {
-							fmt.Println("failed to send file data: ", err)
-							return err
-						}
-					}
-
-					if err == io.EOF {
-						break
-					}
-				}
-
-				meta = overlay.RtcMetadata{
-					Type: overlay.RtcMetadataTypeFileComplete,
-				}
-
-				raw, err = json.Marshal(meta)
-				if err != nil {
-					panic(err)
-				}
-
-				if err := send.RtcDc.SendText(string(raw)); err != nil {
-					fmt.Println("failed to send file complete message", err)
-				}
-
-				select {
-				case <-send.WaitTransferDone:
-					logger.Info("received file transfer acknowledgment")
-					return nil
-				}
-			}
-
 			netns.SetDialerOverride(s.Dialer())
 			ts, err := newTSNet("send", verbose)
 			if err != nil {
@@ -268,7 +199,9 @@ func cpCmd() *serpent.Command {
 			}
 
 			logf("Bringing WireGuard up..")
-			ts.Up(ctx)
+			if _, err := ts.Up(ctx); err != nil {
+				return fmt.Errorf("bring wireguard up: %w", err)
+			}
 			logf("WireGuard is ready!")
 
 			lc, err := ts.LocalClient()
@@ -292,10 +225,11 @@ func cpCmd() *serpent.Command {
 				fiStat.Size(),
 				fmt.Sprintf("Uploading %q", fiPath),
 			)
+			defer bar.Close()
 			barReader := progressbar.NewReader(fi, bar)
 
 			hc := ts.HTTPClient()
-			req, err := http.NewRequest(http.MethodPost, fmt.Sprintf("http://%s:4444/%s", ip.String(), fiName), &barReader)
+			req, err := http.NewRequestWithContext(ctx, http.MethodPost, fileUploadURL(ip, fiName), &barReader)
 			if err != nil {
 				return err
 			}
@@ -307,12 +241,13 @@ func cpCmd() *serpent.Command {
 			}
 			defer res.Body.Close()
 
-			out, err := httputil.DumpResponse(res, true)
+			body, err := readUploadResponse(res)
 			if err != nil {
 				return err
 			}
-			bar.Close()
-			fmt.Println(string(out))
+			if len(body) > 0 {
+				_, _ = fmt.Fprintln(inv.Stdout, body)
+			}
 
 			return nil
 		},
@@ -326,7 +261,7 @@ func cpCmd() *serpent.Command {
 			},
 			{
 				Flag:        "derp-config-file",
-				Description: "File which specifies the DERP config to use. In the structure of https://pkg.go.dev/tailscale.com@v1.74.1/tailcfg#DERPMap. By default, https://controlplane.tailscale.com/derpmap/default is used.",
+				Description: "File which specifies the DERP config to use. In the structure of https://pkg.go.dev/tailscale.com/tailcfg#DERPMap. By default, https://controlplane.tailscale.com/derpmap/default is used.",
 				Default:     "",
 				Value:       serpent.StringOf(&derpmapFi),
 			},
@@ -350,4 +285,25 @@ func cpCmd() *serpent.Command {
 			},
 		},
 	}
+}
+
+func fileUploadURL(ip netip.Addr, fileName string) string {
+	u := url.URL{
+		Scheme: "http",
+		Host:   net.JoinHostPort(ip.String(), "4444"),
+		Path:   "/" + fileName,
+	}
+	return u.String()
+}
+
+func readUploadResponse(res *http.Response) (string, error) {
+	body, err := io.ReadAll(io.LimitReader(res.Body, 64<<10))
+	if err != nil {
+		return "", fmt.Errorf("read upload response: %w", err)
+	}
+	message := strings.TrimSpace(string(body))
+	if res.StatusCode < http.StatusOK || res.StatusCode >= http.StatusMultipleChoices {
+		return "", fmt.Errorf("upload failed: %s: %s", res.Status, message)
+	}
+	return message, nil
 }

@@ -4,7 +4,6 @@ import (
 	"net/netip"
 
 	"github.com/google/uuid"
-	"github.com/pion/webrtc/v4"
 	"tailscale.com/tailcfg"
 )
 
@@ -27,10 +26,6 @@ const (
 	messageTypeHello
 	messageTypeHelloResponse
 	messageTypeNodeUpdate
-
-	messageTypeWebRTCOffer
-	messageTypeWebRTCAnswer
-	messageTypeWebRTCCandidate
 )
 
 type overlayMessage struct {
@@ -38,9 +33,6 @@ type overlayMessage struct {
 
 	HostInfo HostInfo
 	Node     tailcfg.Node
-
-	WebrtcDescription *webrtc.SessionDescription
-	WebrtcCandidate   *webrtc.ICECandidateInit
 }
 
 type HostInfo struct {

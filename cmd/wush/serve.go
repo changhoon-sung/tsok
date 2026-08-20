@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"net/netip"
 	"os"
+	"path"
+	"path/filepath"
 	"strings"
 	"sync"
 
@@ -86,8 +88,6 @@ func serveCmd() *serpent.Command {
 				hlog("Your auth key is:")
 				fmt.Println("  >", cliui.Code(r.ClientAuth().AuthKey()))
 				hlog("Use this key to authenticate other " + cliui.Code("wush") + " commands to this instance.")
-				hlog("Visit the following link to connect via the browser:")
-				fmt.Println("  >", cliui.Code("https://wush.dev#"+r.ClientAuth().AuthKey()))
 			} else {
 				fmt.Println(cliui.Code(r.ClientAuth().AuthKey()))
 				hlog("The auth key has been printed to stdout")
@@ -218,7 +218,7 @@ func serveCmd() *serpent.Command {
 			},
 			{
 				Flag:        "derp-config-file",
-				Description: "File which specifies the DERP config to use. In the structure of https://pkg.go.dev/tailscale.com@v1.74.1/tailcfg#DERPMap.",
+				Description: "File which specifies the DERP config to use. In the structure of https://pkg.go.dev/tailscale.com/tailcfg#DERPMap.",
 				Default:     "",
 				Value:       serpent.StringOf(&derpmapFi),
 			},
@@ -297,7 +297,11 @@ func cpHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	fiName := strings.TrimPrefix(r.URL.Path, "/")
+	fiName, err := uploadFileName(r.URL.Path)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 	defer r.Body.Close()
 
 	fi, err := os.OpenFile(fiName, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0644)
@@ -305,20 +309,27 @@ func cpHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	defer fi.Close()
 
 	bar := progressbar.DefaultBytes(
 		r.ContentLength,
 		fmt.Sprintf("Downloading %q", fiName),
 	)
+	defer bar.Close()
 	_, err = io.Copy(io.MultiWriter(fi, bar), r.Body)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	fi.Close()
-	bar.Close()
-
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte(fmt.Sprintf("File %q written", fiName)))
 	fmt.Printf("Received file %s from %s\n", fiName, r.RemoteAddr)
+}
+
+func uploadFileName(requestPath string) (string, error) {
+	name := strings.TrimPrefix(requestPath, "/")
+	if name == "" || name == "." || name == ".." || strings.Contains(name, `\`) || name != path.Base(name) || name != filepath.Base(name) {
+		return "", fmt.Errorf("invalid upload filename %q", requestPath)
+	}
+	return name, nil
 }

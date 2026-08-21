@@ -16,7 +16,6 @@ import (
 	"time"
 
 	"github.com/pion/stun/v3"
-	"github.com/puzpuzpuz/xsync/v3"
 	"tailscale.com/derp"
 	"tailscale.com/derp/derphttp"
 	"tailscale.com/net/netcheck"
@@ -62,6 +61,8 @@ type Receive struct {
 	derpRegionID uint16
 
 	lastNode atomic.Pointer[tailcfg.Node]
+	peerMu   sync.Mutex
+	peer     string
 	// in funnels node updates from other peers to us
 	in chan *tailcfg.Node
 	// out fans out our node updates to peers
@@ -165,8 +166,7 @@ func (r *Receive) ListenOverlaySTUN(ctx context.Context) (<-chan struct{}, error
 		}
 	}()
 
-	// node priv -> udp addr
-	peers := xsync.NewMapOf[key.NodePublic, netip.AddrPort]()
+	var peer atomic.Pointer[netip.AddrPort]
 
 	go func() {
 		for {
@@ -184,12 +184,13 @@ func (r *Receive) ListenOverlaySTUN(ctx context.Context) (<-chan struct{}, error
 				}
 
 				sealed := r.SelfPriv.SealTo(r.PeerPriv.Public(), raw)
-				peers.Range(func(_ key.NodePublic, addr netip.AddrPort) bool {
-					if _, writeErr := conn.WriteToUDPAddrPort(sealed, addr); writeErr != nil {
-						r.HumanLogf("%s Failed to send updated node over udp: %s", cliui.Timestamp(time.Now()), writeErr)
-					}
-					return true
-				})
+				peerAddr := peer.Load()
+				if peerAddr == nil {
+					continue
+				}
+				if _, writeErr := conn.WriteToUDPAddrPort(sealed, *peerAddr); writeErr != nil {
+					r.HumanLogf("%s Failed to send updated node over udp: %s", cliui.Timestamp(time.Now()), writeErr)
+				}
 			}
 		}
 	}()
@@ -245,13 +246,16 @@ func (r *Receive) ListenOverlaySTUN(ctx context.Context) (<-chan struct{}, error
 				continue
 			}
 
-			res, key, err := r.handleNextMessage(key.NodePublic{}, buf, "STUN")
+			res, err := r.handleNextMessage(addr.String(), buf, "STUN")
 			if err != nil {
 				r.HumanLogf("Failed to handle overlay message: %s", err.Error())
 				continue
 			}
 
-			peers.Store(key, addr)
+			if peer.Load() == nil {
+				peerAddr := addr
+				peer.Store(&peerAddr)
+			}
 
 			if res != nil {
 				if _, writeErr := conn.WriteToUDPAddrPort(res, addr); writeErr != nil {
@@ -274,8 +278,7 @@ func (r *Receive) ListenOverlayDERP(ctx context.Context) error {
 		return err
 	}
 
-	// node priv -> derp priv
-	peers := xsync.NewMapOf[key.NodePublic, key.NodePublic]()
+	var peer atomic.Pointer[key.NodePublic]
 
 	go func() {
 		for {
@@ -293,12 +296,13 @@ func (r *Receive) ListenOverlayDERP(ctx context.Context) error {
 				}
 
 				sealed := r.SelfPriv.SealTo(r.PeerPriv.Public(), raw)
-				peers.Range(func(_, derpKey key.NodePublic) bool {
-					if sendErr := c.Send(derpKey, sealed); sendErr != nil {
-						r.HumanLogf("Send updated node over DERP: %s", sendErr)
-					}
-					return true
-				})
+				derpKey := peer.Load()
+				if derpKey == nil {
+					continue
+				}
+				if sendErr := c.Send(*derpKey, sealed); sendErr != nil {
+					r.HumanLogf("Send updated node over DERP: %s", sendErr)
+				}
 			}
 		}
 	}()
@@ -311,13 +315,16 @@ func (r *Receive) ListenOverlayDERP(ctx context.Context) error {
 
 		switch msg := msg.(type) {
 		case derp.ReceivedPacket:
-			res, key, err := r.handleNextMessage(msg.Source, msg.Data, "DERP")
+			res, err := r.handleNextMessage(msg.Source.String(), msg.Data, "DERP")
 			if err != nil {
 				r.HumanLogf("Failed to handle overlay message from %s: %s", msg.Source.ShortString(), err.Error())
 				continue
 			}
 
-			peers.Store(key, msg.Source)
+			if peer.Load() == nil {
+				derpKey := msg.Source
+				peer.Store(&derpKey)
+			}
 
 			if res != nil {
 				err = c.Send(msg.Source, res)
@@ -330,16 +337,19 @@ func (r *Receive) ListenOverlayDERP(ctx context.Context) error {
 	}
 }
 
-func (r *Receive) handleNextMessage(_ key.NodePublic, msg []byte, system string) (resRaw []byte, nodeKey key.NodePublic, _ error) {
+func (r *Receive) handleNextMessage(source string, msg []byte, system string) ([]byte, error) {
 	cleartext, ok := r.SelfPriv.OpenFrom(r.PeerPriv.Public(), msg)
 	if !ok {
-		return nil, key.NodePublic{}, errors.New("message failed decryption")
+		return nil, errors.New("message failed decryption")
 	}
 
 	var ovMsg overlayMessage
 	err := json.Unmarshal(cleartext, &ovMsg)
 	if err != nil {
-		return nil, key.NodePublic{}, fmt.Errorf("unmarshal overlay message: %w", err)
+		return nil, fmt.Errorf("unmarshal overlay message: %w", err)
+	}
+	if err := r.acceptPeer(source, ovMsg.Typ); err != nil {
+		return nil, err
 	}
 
 	res := overlayMessage{}
@@ -374,7 +384,7 @@ func (r *Receive) handleNextMessage(_ key.NodePublic, msg []byte, system string)
 	}
 
 	if res.Typ == 0 {
-		return nil, ovMsg.Node.Key, nil
+		return nil, nil
 	}
 
 	raw, err := json.Marshal(res)
@@ -383,5 +393,25 @@ func (r *Receive) handleNextMessage(_ key.NodePublic, msg []byte, system string)
 	}
 
 	sealed := r.SelfPriv.SealTo(r.PeerPriv.Public(), raw)
-	return sealed, ovMsg.Node.Key, nil
+	return sealed, nil
+}
+
+func (r *Receive) acceptPeer(source string, typ messageType) error {
+	if source == "" {
+		return errors.New("overlay peer source is empty")
+	}
+
+	r.peerMu.Lock()
+	defer r.peerMu.Unlock()
+	if r.peer == "" {
+		if typ != messageTypeHello {
+			return errors.New("first overlay message must be hello")
+		}
+		r.peer = source
+		return nil
+	}
+	if r.peer != source {
+		return errors.New("another overlay peer is already connected")
+	}
+	return nil
 }

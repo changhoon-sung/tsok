@@ -42,7 +42,18 @@ $ wush ssh
 ┃ Enter the Auth key:
 ┃ > <auth-key>
 coder@colin:~$
+
+# Or use the system OpenSSH client without a local listening port
+$ ssh -o 'ProxyCommand=wush connect --stdio --quiet --auth-key <auth-key> 127.0.0.1:%p' coder@wush
 ```
+
+`wush connect --stdio` bridges stdin and stdout to a TCP port on the host's
+loopback interface. This makes it suitable for OpenSSH `ProxyCommand` and other
+clients that support a stdio transport, while keeping features such as agent
+forwarding, port forwarding, `scp`, `rsync`, and IDE SSH integrations in the
+system OpenSSH client. The server's `port-forward` capability, enabled by
+default, must remain enabled. Multiple client processes may use the same wush
+auth key concurrently; stopped processes are removed from the active peer set.
 
 [![asciicast](https://asciinema.org/a/ZrCNiRRkeHUi5Lj3fqC3ovLqi.svg)](https://asciinema.org/a/ZrCNiRRkeHUi5Lj3fqC3ovLqi)
 

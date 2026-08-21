@@ -47,6 +47,7 @@ func main() {
 		Children: []*serpent.Command{
 			versionCmd(),
 			sshCmd(),
+			connectCmd(),
 			serveCmd(),
 			rsyncCmd(),
 			cpCmd(),

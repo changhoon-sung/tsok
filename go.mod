@@ -13,7 +13,6 @@ require (
 	github.com/klauspost/compress v1.19.2
 	github.com/muesli/termenv v0.16.0
 	github.com/pion/stun/v3 v3.1.7
-	github.com/puzpuzpuz/xsync/v3 v3.5.1
 	github.com/schollz/progressbar/v3 v3.19.1
 	go4.org/mem v0.0.0-20240501181205-ae6ca9944745
 	golang.org/x/crypto v0.55.0

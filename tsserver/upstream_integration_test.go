@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/hex"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"net/netip"
 	"net/url"
 	"strings"
@@ -173,5 +175,17 @@ func TestApplyPeerChangePreservesLegacyDERP(t *testing.T) {
 	}
 	if got, want := node.LegacyDERPString, tailcfg.DerpMagicIP+":7"; got != want {
 		t.Fatalf("LegacyDERPString = %q, want %q", got, want)
+	}
+}
+
+func TestNoiseUpgradeRejectsSecondActiveConnection(t *testing.T) {
+	s := &server{}
+	s.noiseActive.Store(true)
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "http://127.0.0.1/ts2021", nil)
+	s.NoiseUpgradeHandler(recorder, request)
+	if got, want := recorder.Code, http.StatusServiceUnavailable; got != want {
+		t.Fatalf("status = %d, want %d", got, want)
 	}
 }

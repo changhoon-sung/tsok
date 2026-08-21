@@ -29,7 +29,6 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/klauspost/compress/zstd"
-	"github.com/puzpuzpuz/xsync/v3"
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/h2c"
 	"tailscale.com/control/controlbase"
@@ -83,12 +82,9 @@ func NewServer(ctx context.Context, logger *slog.Logger, ov overlay.Overlay, dm 
 		nodeUpdate:      make(chan struct{}, 1),
 		listener:        listener,
 		controlPath:     "/" + hex.EncodeToString(secret[:]),
-		noiseLimit:      make(chan struct{}, 16),
 		overlay:         ov,
 		derpMap:         dm,
-
-		peerMap:       xsync.NewMapOf[tailcfg.NodeID, *tailcfg.Node](),
-		peerMapUpdate: make(chan struct{}, 1),
+		peerUpdate:      make(chan struct{}, 1),
 	}
 
 	return s, nil
@@ -102,10 +98,11 @@ type server struct {
 	noisePrivateKey key.MachinePrivate
 	listener        net.Listener
 	controlPath     string
-	noiseLimit      chan struct{}
 	httpMu          sync.Mutex
 	httpServer      *http.Server
-	noiseConns      sync.Map
+	noiseMu         sync.Mutex
+	noiseConn       *controlbase.Conn
+	noiseActive     atomic.Bool
 	closeOnce       sync.Once
 	closeErr        error
 
@@ -114,8 +111,8 @@ type server struct {
 	node       atomic.Pointer[tailcfg.Node]
 	nodeUpdate chan struct{}
 
-	peerMap       *xsync.MapOf[tailcfg.NodeID, *tailcfg.Node]
-	peerMapUpdate chan struct{}
+	peer       atomic.Pointer[tailcfg.Node]
+	peerUpdate chan struct{}
 }
 
 func (s *server) ControlURL() string {
@@ -138,14 +135,15 @@ func (s *server) Close() error {
 		if err := s.listener.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
 			closeErrors = append(closeErrors, err)
 		}
-		s.noiseConns.Range(func(connection, _ any) bool {
-			noiseConn := connection.(*controlbase.Conn)
+		s.noiseMu.Lock()
+		noiseConn := s.noiseConn
+		s.noiseConn = nil
+		s.noiseMu.Unlock()
+		if noiseConn != nil {
 			if err := noiseConn.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
 				closeErrors = append(closeErrors, err)
 			}
-			s.noiseConns.Delete(connection)
-			return true
-		})
+		}
 		s.closeErr = errors.Join(closeErrors...)
 	})
 	return s.closeErr
@@ -176,10 +174,9 @@ func (s *server) ListenAndServe(_ context.Context) error {
 				if node == nil {
 					continue
 				}
-				node = node.Clone()
-				s.peerMap.Store(node.ID, node)
+				s.peer.Store(node.Clone())
 				select {
-				case s.peerMapUpdate <- struct{}{}:
+				case s.peerUpdate <- struct{}{}:
 				default:
 				}
 			case <-s.nodeUpdate:
@@ -265,21 +262,19 @@ func (s *server) KeyHandler(
 }
 
 func (s *server) NoiseUpgradeHandler(w http.ResponseWriter, r *http.Request) {
-	select {
-	case s.noiseLimit <- struct{}{}:
-		defer func() { <-s.noiseLimit }()
-	default:
-		http.Error(w, "too many local control connections", http.StatusServiceUnavailable)
+	if !s.noiseActive.CompareAndSwap(false, true) {
+		http.Error(w, "a local control connection is already active", http.StatusServiceUnavailable)
 		return
 	}
+	defer s.noiseActive.Store(false)
 
 	s.logger.Info("got noise upgrade request")
 	ns := noiseServer{
 		logger:     s.logger,
 		derpMap:    s.derpMap,
 		challenge:  key.NewChallenge(),
-		peers:      s.peerMap,
-		peerUpdate: s.peerMapUpdate,
+		peer:       &s.peer,
+		peerUpdate: s.peerUpdate,
 		node:       &s.node,
 		nodeUpdate: s.nodeUpdate,
 		getIPs:     s.overlay.IPs,
@@ -300,9 +295,15 @@ func (s *server) NoiseUpgradeHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.logger.Info("accepted control http")
-	s.noiseConns.Store(noiseConn, struct{}{})
+	s.noiseMu.Lock()
+	s.noiseConn = noiseConn
+	s.noiseMu.Unlock()
 	defer func() {
-		s.noiseConns.Delete(noiseConn)
+		s.noiseMu.Lock()
+		if s.noiseConn == noiseConn {
+			s.noiseConn = nil
+		}
+		s.noiseMu.Unlock()
 		_ = noiseConn.Close()
 	}()
 	if s.ctx.Err() != nil {
@@ -359,7 +360,7 @@ type noiseServer struct {
 	derpMap        *tailcfg.DERPMap
 	getIPs         func() []netip.Addr
 
-	peers      *xsync.MapOf[tailcfg.NodeID, *tailcfg.Node]
+	peer       *atomic.Pointer[tailcfg.Node]
 	peerUpdate chan struct{}
 
 	node       *atomic.Pointer[tailcfg.Node]
@@ -506,18 +507,12 @@ func (ns *noiseServer) NoisePollNetMapHandler(
 
 }
 
-func (ns *noiseServer) peerMap() []*tailcfg.Node {
-	peers := []*tailcfg.Node{}
-
-	ns.peers.Range(func(key tailcfg.NodeID, value *tailcfg.Node) bool {
-		peers = append(peers, value.Clone())
-		return true
-	})
-	slices.SortFunc(peers, func(a, b *tailcfg.Node) int {
-		return cmp.Compare(a.ID, b.ID)
-	})
-
-	return peers
+func (ns *noiseServer) peers() []*tailcfg.Node {
+	peer := ns.peer.Load()
+	if peer == nil {
+		return nil
+	}
+	return []*tailcfg.Node{peer.Clone()}
 }
 
 func (ns *noiseServer) handleStreaming(ctx context.Context, w http.ResponseWriter, req *tailcfg.MapRequest) {
@@ -540,7 +535,7 @@ func (ns *noiseServer) handleStreaming(ctx context.Context, w http.ResponseWrite
 		Debug: &tailcfg.Debug{
 			DisableLogTail: true,
 		},
-		Peers:        ns.peerMap(),
+		Peers:        ns.peers(),
 		PacketFilter: tailcfg.FilterAllowAll,
 	}
 
@@ -563,7 +558,7 @@ func (ns *noiseServer) handleStreaming(ctx context.Context, w http.ResponseWrite
 			res := &tailcfg.MapResponse{
 				KeepAlive:   false,
 				ControlTime: ptr.To(time.Now()),
-				Peers:       ns.peerMap(),
+				Peers:       ns.peers(),
 			}
 
 			err := writeMapResponse(w, req, res)

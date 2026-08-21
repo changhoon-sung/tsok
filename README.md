@@ -1,7 +1,5 @@
 # wush
 
-[![Go Reference](https://pkg.go.dev/badge/github.com/coder/wush.svg)](https://pkg.go.dev/github.com/coder/wush)
-
 `wush` is a command line tool that lets you easily transfer files and open
 shells over a peer-to-peer WireGuard connection. It's similar to
 [magic-wormhole](https://github.com/magic-wormhole/magic-wormhole) but:
@@ -75,19 +73,14 @@ auth key concurrently; stopped processes are removed from the active peer set.
 
 ## Install
 
-Using install script
+Install the latest Linux or macOS release for `amd64` or `arm64`:
 
 ```bash
-curl -fsSL https://github.com/coder/wush/raw/refs/heads/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/changhoon-sung/wush/main/install.sh | sh
 ```
 
-Using Homebrew
-
-```bash
-brew install wush
-```
-
-For a manual installation, see the [latest release](https://github.com/coder/wush/releases/latest).
+For a manual installation, see the
+[latest release](https://github.com/changhoon-sung/wush/releases/latest).
 
 > [!TIP]
 > To increase transfer speeds, `wush` attempts to increase the buffer size of

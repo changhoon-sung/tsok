@@ -46,12 +46,15 @@ nfpms:
       - deb
 archives:
   - id: "tar_or_zip"
-    format: tar.gz
+    formats:
+      - tar.gz
     format_overrides:
       - goos: windows
-        format: zip
+        formats:
+          - zip
       - goos: darwin
-        format: zip
+        formats:
+          - zip
 checksum:
   name_template: "{{ .ProjectName }}_{{ .Version }}_SHA256SUMS"
   algorithm: sha256

@@ -11,28 +11,22 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 
-	"github.com/mattn/go-isatty"
-	"github.com/prometheus/client_golang/prometheus"
 	"github.com/schollz/progressbar/v3"
-	"github.com/spf13/afero"
-	xslices "golang.org/x/exp/slices"
-	"golang.org/x/xerrors"
+	"golang.org/x/term"
 	"tailscale.com/ipn/store"
-	"tailscale.com/net/netns"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tsnet"
 
-	cslog "cdr.dev/slog"
-	csloghuman "cdr.dev/slog/sloggers/sloghuman"
-	"github.com/coder/coder/v2/agent/agentssh"
 	"github.com/coder/pretty"
 	"github.com/coder/serpent"
 	"github.com/coder/wush/cliui"
 	"github.com/coder/wush/overlay"
 	"github.com/coder/wush/tsserver"
+	"github.com/coder/wush/xssh"
 )
 
 func serveCmd() *serpent.Command {
@@ -84,7 +78,7 @@ func serveCmd() *serpent.Command {
 			}
 
 			// Ensure we always print the auth key on stdout
-			if isatty.IsTerminal(os.Stdout.Fd()) {
+			if term.IsTerminal(int(os.Stdout.Fd())) {
 				hlog("Your auth key is:")
 				fmt.Println("  >", cliui.Code(r.ClientAuth().AuthKey()))
 				hlog("Use this key to authenticate other " + cliui.Code("wush") + " commands to this instance.")
@@ -97,31 +91,29 @@ func serveCmd() *serpent.Command {
 			if err != nil {
 				return err
 			}
+			defer s.Close()
 
-			go s.ListenAndServe(ctx)
-			netns.SetDialerOverride(s.Dialer())
-			ts, err := newTSNet("receive", verbose)
+			go func() {
+				if err := s.ListenAndServe(ctx); err != nil {
+					logger.Error("local control server stopped", "err", err)
+				}
+			}()
+			ts, err := newTSNet("receive", verbose, s.ControlURL())
 			if err != nil {
 				return err
 			}
+			defer ts.Close()
 
 			_, err = ts.Up(ctx)
 			if err != nil {
 				return fmt.Errorf("bring wireguard up: %w", err)
 			}
-			fs := afero.NewOsFs()
-
 			// hlog("WireGuard is ready")
 
 			closers := []io.Closer{}
 
-			if xslices.Contains(enabled, "ssh") && !xslices.Contains(disabled, "ssh") {
-				sshSrv, err := agentssh.NewServer(ctx,
-					cslog.Make(csloghuman.Sink(logSink)),
-					prometheus.NewRegistry(),
-					fs,
-					nil,
-				)
+			if slices.Contains(enabled, "ssh") && !slices.Contains(disabled, "ssh") {
+				sshSrv, err := xssh.NewServer()
 				if err != nil {
 					return err
 				}
@@ -145,7 +137,7 @@ func serveCmd() *serpent.Command {
 				hlog("SSH server " + pretty.Sprint(cliui.DefaultStyles.Disabled, "disabled"))
 			}
 
-			if xslices.Contains(enabled, "cp") && !xslices.Contains(disabled, "cp") {
+			if slices.Contains(enabled, "cp") && !slices.Contains(disabled, "cp") {
 				cpListener, err := ts.Listen("tcp", ":4444")
 				if err != nil {
 					return err
@@ -163,7 +155,7 @@ func serveCmd() *serpent.Command {
 				hlog("File transfer server " + pretty.Sprint(cliui.DefaultStyles.Disabled, "disabled"))
 			}
 
-			if xslices.Contains(enabled, "port-forward") && !xslices.Contains(disabled, "port-forward") {
+			if slices.Contains(enabled, "port-forward") && !slices.Contains(disabled, "port-forward") {
 				ts.RegisterFallbackTCPHandler(func(src, dst netip.AddrPort) (handler func(net.Conn), intercept bool) {
 					return func(src net.Conn) {
 						dst, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", dst.Port()))
@@ -226,7 +218,7 @@ func serveCmd() *serpent.Command {
 	}
 }
 
-func newTSNet(direction string, verbose bool) (*tsnet.Server, error) {
+func newTSNet(direction string, verbose bool, controlURL string) (*tsnet.Server, error) {
 	var err error
 	tmp := os.TempDir()
 	srv := new(tsnet.Server)
@@ -234,7 +226,7 @@ func newTSNet(direction string, verbose bool) (*tsnet.Server, error) {
 	srv.Hostname = "wush-" + direction
 	srv.Ephemeral = true
 	srv.AuthKey = direction
-	srv.ControlURL = "http://127.0.0.1:8080"
+	srv.ControlURL = controlURL
 	srv.Logf = func(format string, args ...any) {}
 	srv.UserLogf = func(format string, args ...any) {}
 	if verbose {
@@ -247,7 +239,7 @@ func newTSNet(direction string, verbose bool) (*tsnet.Server, error) {
 
 	srv.Store, err = store.New(func(format string, args ...any) {}, "mem:wush")
 	if err != nil {
-		return nil, xerrors.Errorf("create state store: %w", err)
+		return nil, fmt.Errorf("create state store: %w", err)
 	}
 
 	return srv, nil

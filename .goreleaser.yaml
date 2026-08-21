@@ -9,67 +9,20 @@ builds:
     ldflags:
       - "-s -w -X main.version={{.Version}} -X main.commit={{.Commit}} -X main.commitDate={{.CommitTimestamp}}"
     goos:
-      - freebsd
-      - openbsd
-      # netbsd and dragonfly do not currently build due to wireguard-go.
-      # - netbsd
-      # - dragonfly
-      - windows
       - linux
       - darwin
     goarch:
       - amd64
-      - "386"
-      - arm
       - arm64
-    goarm:
-      - "7"
-    ignore:
-      - goos: darwin
-        goarch: "386"
-      - goos: windows
-        goarch: "arm"
     binary: "{{ .ProjectName }}"
-nfpms:
-  - vendor: Coder Technologies Inc.
-    homepage: https://coder.com/
-    maintainer: Colin Adler <colin@coder.com>
-    description: |-
-      Wush installer package.
-      Wush creates secure WireGuard tunnels between two devices.
-    license: CC0-1.0
-    contents:
-      - src: LICENSE
-        dst: "/usr/share/doc/{{ .ProjectName }}/copyright"
-    formats:
-      - apk
-      - deb
 archives:
-  - id: "tar_or_zip"
+  - id: "binaries"
     formats:
-      - tar.gz
-    format_overrides:
-      - goos: windows
-        formats:
-          - zip
-      - goos: darwin
-        formats:
-          - zip
+      - binary
+    name_template: "{{ .ProjectName }}_{{ .Os }}_{{ .Arch }}"
 checksum:
   name_template: "{{ .ProjectName }}_{{ .Version }}_SHA256SUMS"
   algorithm: sha256
-signs:
-  - artifacts: checksum
-    args:
-      # if you are using this in a GitHub action or some other automated pipeline, you
-      # need to pass the batch flag to indicate its not interactive.
-      - "--batch"
-      - "--local-user"
-      - "{{ .Env.GPG_FINGERPRINT }}"
-      - "--output"
-      - "${signature}"
-      - "--detach-sign"
-      - "${artifact}"
 # release:
 #   draft: true
 changelog:

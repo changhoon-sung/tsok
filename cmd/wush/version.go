@@ -14,7 +14,7 @@ func versionCmd() *serpent.Command {
 		Handler: func(inv *serpent.Invocation) error {
 			bi := getBuildInfo()
 			fmt.Printf("Wush %s-%s %s\n", bi.version, bi.commitHash[:7], bi.commitTime.Format(time.RFC1123))
-			fmt.Printf("https://github.com/coder/wush/commit/%s\n", commit)
+			fmt.Printf("https://github.com/changhoon-sung/wush/commit/%s\n", commit)
 			return nil
 		},
 		Options: serpent.OptionSet{},

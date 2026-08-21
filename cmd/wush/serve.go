@@ -77,13 +77,19 @@ func serveCmd() *serpent.Command {
 				return fmt.Errorf("unknown overlay type: %s", overlayType)
 			}
 
-			// Ensure we always print the auth key on stdout
+			authKey := r.ClientAuth().AuthKey()
+			portForwardEnabled := slices.Contains(enabled, "port-forward") && !slices.Contains(disabled, "port-forward")
+
+			// Ensure we always print the auth key on stdout.
 			if term.IsTerminal(int(os.Stdout.Fd())) {
 				hlog("Your auth key is:")
-				fmt.Println("  >", cliui.Code(r.ClientAuth().AuthKey()))
+				fmt.Println("  >", cliui.Code(authKey))
 				hlog("Use this key to authenticate other " + cliui.Code("wush") + " commands to this instance.")
+				if portForwardEnabled {
+					hlog("\n%s", serveOpenSSHHelp(authKey, serveUsername()))
+				}
 			} else {
-				fmt.Println(cliui.Code(r.ClientAuth().AuthKey()))
+				fmt.Println(cliui.Code(authKey))
 				hlog("The auth key has been printed to stdout")
 			}
 
@@ -155,7 +161,7 @@ func serveCmd() *serpent.Command {
 				hlog("File transfer server " + pretty.Sprint(cliui.DefaultStyles.Disabled, "disabled"))
 			}
 
-			if slices.Contains(enabled, "port-forward") && !slices.Contains(disabled, "port-forward") {
+			if portForwardEnabled {
 				ts.RegisterFallbackTCPHandler(func(src, dst netip.AddrPort) (handler func(net.Conn), intercept bool) {
 					return func(src net.Conn) {
 						dst, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", dst.Port()))
@@ -216,6 +222,27 @@ func serveCmd() *serpent.Command {
 			},
 		},
 	}
+}
+
+func serveUsername() string {
+	if username := os.Getenv("USER"); username != "" {
+		return username
+	}
+	if username := os.Getenv("USERNAME"); username != "" {
+		return username
+	}
+	return "user"
+}
+
+func serveOpenSSHHelp(authKey, username string) string {
+	return fmt.Sprintf(`Connect with OpenSSH:
+WUSH_AUTH_KEY=%s ssh -o 'ProxyCommand=wush connect --stdio --quiet 127.0.0.1:%%p' %s@wush
+
+Or add this block to ~/.ssh/config:
+Host wush
+  HostName wush
+  User %s
+  ProxyCommand env WUSH_AUTH_KEY=%s wush connect --stdio --quiet 127.0.0.1:%%p`, authKey, username, username, authKey)
 }
 
 func newTSNet(direction string, verbose bool, controlURL string) (*tsnet.Server, error) {

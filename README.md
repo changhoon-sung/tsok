@@ -28,23 +28,33 @@ Picked DERP region Toronto as overlay home
 Your auth key is:
     >  <auth-key>
 Use this key to authenticate other wush commands to this instance.
+
+Connect with OpenSSH:
+WUSH_AUTH_KEY=<auth-key> ssh -o 'ProxyCommand=wush connect --stdio --quiet 127.0.0.1:%p' coder@wush
+
+Or add this block to ~/.ssh/config:
+Host wush
+  HostName wush
+  User coder
+  ProxyCommand env WUSH_AUTH_KEY=<auth-key> wush connect --stdio --quiet 127.0.0.1:%p
 ```
 
 On the client machine:
 
 ```bash
 # Copy a file to the host
-$ wush cp 1gb.txt
+$ WUSH_AUTH_KEY=<auth-key> wush cp 1gb.txt
 Uploading "1gb.txt" 100% |██████████████████████████████████████████████| (2.1/2.1 GB, 376 MB/s)
 
 # Open a shell to the host
-$ wush ssh
-┃ Enter the Auth key:
-┃ > <auth-key>
+$ WUSH_AUTH_KEY=<auth-key> wush ssh
 coder@colin:~$
 
 # Or use the system OpenSSH client without a local listening port
-$ ssh -o 'ProxyCommand=wush connect --stdio --quiet --auth-key <auth-key> 127.0.0.1:%p' coder@wush
+$ WUSH_AUTH_KEY=<auth-key> ssh -o 'ProxyCommand=wush connect --stdio --quiet 127.0.0.1:%p' coder@wush
+
+# After saving the generated block to ~/.ssh/config
+$ ssh wush
 ```
 
 `wush connect --stdio` bridges stdin and stdout to a TCP port on the host's

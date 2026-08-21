@@ -155,6 +155,26 @@ func TestBridgeStdioCancellation(t *testing.T) {
 	}
 }
 
+func TestServeOpenSSHHelp(t *testing.T) {
+	t.Parallel()
+
+	got := serveOpenSSHHelp("test-auth-key", "alice")
+	want := `Connect with OpenSSH:
+WUSH_AUTH_KEY=test-auth-key ssh -o 'ProxyCommand=wush connect --stdio --quiet 127.0.0.1:%p' alice@wush
+
+Or add this block to ~/.ssh/config:
+Host wush
+  HostName wush
+  User alice
+  ProxyCommand env WUSH_AUTH_KEY=test-auth-key wush connect --stdio --quiet 127.0.0.1:%p`
+	if got != want {
+		t.Fatalf("OpenSSH help:\n%s\nwant:\n%s", got, want)
+	}
+	if strings.Contains(got, "--auth-key") {
+		t.Fatal("OpenSSH help passes the auth key in argv")
+	}
+}
+
 func TestParsePortRangeIncludesMaximumPort(t *testing.T) {
 	t.Parallel()
 

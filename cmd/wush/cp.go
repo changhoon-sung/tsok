@@ -20,7 +20,6 @@ import (
 	"github.com/coder/wush/overlay"
 	"github.com/coder/wush/tsserver"
 	"github.com/schollz/progressbar/v3"
-	"tailscale.com/net/netns"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/ptr"
 )
@@ -181,6 +180,7 @@ func cpCmd() *serpent.Command {
 			if err != nil {
 				return err
 			}
+			defer s.Close()
 
 			if send.Auth.ReceiverDERPRegionID != 0 {
 				go send.ListenOverlayDERP(ctx)
@@ -190,13 +190,17 @@ func cpCmd() *serpent.Command {
 				return errors.New("auth key provided neither DERP nor STUN")
 			}
 
-			go s.ListenAndServe(ctx)
+			go func() {
+				if err := s.ListenAndServe(ctx); err != nil {
+					logger.Error("local control server stopped", "err", err)
+				}
+			}()
 
-			netns.SetDialerOverride(s.Dialer())
-			ts, err := newTSNet("send", verbose)
+			ts, err := newTSNet("send", verbose, s.ControlURL())
 			if err != nil {
 				return err
 			}
+			defer ts.Close()
 
 			logf("Bringing WireGuard up..")
 			if _, err := ts.Up(ctx); err != nil {

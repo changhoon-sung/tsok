@@ -24,6 +24,7 @@ import (
 	"tailscale.com/net/portmapper"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
+	"tailscale.com/util/eventbus"
 
 	"github.com/coder/pretty"
 	"github.com/coder/wush/cliui"
@@ -77,11 +78,18 @@ func (r *Receive) IPs() []netip.Addr {
 }
 
 func (r *Receive) PickDERPHome(ctx context.Context) error {
-
 	nm := netmon.NewStatic()
+	bus := eventbus.New()
+	defer bus.Close()
+	pm := portmapper.NewClient(portmapper.Config{
+		EventBus: bus,
+		Logf:     func(format string, args ...any) {},
+		NetMon:   nm,
+	})
+	defer pm.Close()
 	nc := netcheck.Client{
 		NetMon:     nm,
-		PortMapper: portmapper.NewClient(func(format string, args ...any) {}, nm, nil, nil, nil),
+		PortMapper: pm,
 		Logf:       func(format string, args ...any) {},
 	}
 

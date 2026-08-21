@@ -1,18 +1,18 @@
 package cliui
 
 import (
+	"errors"
 	"flag"
 	"os"
 	"sync"
 	"time"
 
 	"github.com/muesli/termenv"
-	"golang.org/x/xerrors"
 
 	"github.com/coder/pretty"
 )
 
-var Canceled = xerrors.New("canceled")
+var Canceled = errors.New("canceled")
 
 // DefaultStyles compose visual elements of the UI.
 var DefaultStyles Styles
@@ -172,7 +172,7 @@ func init() {
 // ValidateNotEmpty is a helper function to disallow empty inputs!
 func ValidateNotEmpty(s string) error {
 	if s == "" {
-		return xerrors.New("Must be provided!")
+		return errors.New("Must be provided!")
 	}
 	return nil
 }

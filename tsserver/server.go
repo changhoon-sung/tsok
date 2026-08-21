@@ -84,6 +84,7 @@ func NewServer(ctx context.Context, logger *slog.Logger, ov overlay.Overlay, dm 
 		controlPath:     "/" + hex.EncodeToString(secret[:]),
 		overlay:         ov,
 		derpMap:         dm,
+		peers:           newPeerStore(),
 		peerUpdate:      make(chan struct{}, 1),
 	}
 
@@ -111,8 +112,43 @@ type server struct {
 	node       atomic.Pointer[tailcfg.Node]
 	nodeUpdate chan struct{}
 
-	peer       atomic.Pointer[tailcfg.Node]
+	peers      *peerStore
 	peerUpdate chan struct{}
+}
+
+type peerStore struct {
+	mu    sync.RWMutex
+	nodes map[string]*tailcfg.Node
+}
+
+func newPeerStore() *peerStore {
+	return &peerStore{nodes: make(map[string]*tailcfg.Node)}
+}
+
+func (p *peerStore) apply(update overlay.PeerUpdate) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if update.Node == nil {
+		delete(p.nodes, update.ID)
+		return
+	}
+	p.nodes[update.ID] = update.Node.Clone()
+}
+
+func (p *peerStore) snapshot() []*tailcfg.Node {
+	p.mu.RLock()
+	peers := make([]*tailcfg.Node, 0, len(p.nodes))
+	for _, node := range p.nodes {
+		peers = append(peers, node.Clone())
+	}
+	p.mu.RUnlock()
+	slices.SortFunc(peers, func(a, b *tailcfg.Node) int {
+		if idOrder := cmp.Compare(a.ID, b.ID); idOrder != 0 {
+			return idOrder
+		}
+		return strings.Compare(a.Key.String(), b.Key.String())
+	})
+	return peers
 }
 
 func (s *server) ControlURL() string {
@@ -167,14 +203,14 @@ func (s *server) ListenAndServe(_ context.Context) error {
 			select {
 			case <-s.ctx.Done():
 				return
-			case node, ok := <-recv:
+			case update, ok := <-recv:
 				if !ok {
 					return
 				}
-				if node == nil {
+				if update.ID == "" {
 					continue
 				}
-				s.peer.Store(node.Clone())
+				s.peers.apply(update)
 				select {
 				case s.peerUpdate <- struct{}{}:
 				default:
@@ -273,7 +309,7 @@ func (s *server) NoiseUpgradeHandler(w http.ResponseWriter, r *http.Request) {
 		logger:     s.logger,
 		derpMap:    s.derpMap,
 		challenge:  key.NewChallenge(),
-		peer:       &s.peer,
+		peerStore:  s.peers,
 		peerUpdate: s.peerUpdate,
 		node:       &s.node,
 		nodeUpdate: s.nodeUpdate,
@@ -360,7 +396,7 @@ type noiseServer struct {
 	derpMap        *tailcfg.DERPMap
 	getIPs         func() []netip.Addr
 
-	peer       *atomic.Pointer[tailcfg.Node]
+	peerStore  *peerStore
 	peerUpdate chan struct{}
 
 	node       *atomic.Pointer[tailcfg.Node]
@@ -508,11 +544,7 @@ func (ns *noiseServer) NoisePollNetMapHandler(
 }
 
 func (ns *noiseServer) peers() []*tailcfg.Node {
-	peer := ns.peer.Load()
-	if peer == nil {
-		return nil
-	}
-	return []*tailcfg.Node{peer.Clone()}
+	return ns.peerStore.snapshot()
 }
 
 func (ns *noiseServer) handleStreaming(ctx context.Context, w http.ResponseWriter, req *tailcfg.MapRequest) {
@@ -526,6 +558,11 @@ func (ns *noiseServer) handleStreaming(ctx context.Context, w http.ResponseWrite
 	keepAlive := time.NewTicker(50 * time.Second)
 	defer keepAlive.Stop()
 
+	initialPeers := ns.peers()
+	knownPeerIDs := make(map[tailcfg.NodeID]struct{}, len(initialPeers))
+	for _, peer := range initialPeers {
+		knownPeerIDs[peer.ID] = struct{}{}
+	}
 	res := &tailcfg.MapResponse{
 		KeepAlive:       false,
 		ControlTime:     ptr.To(time.Now()),
@@ -535,7 +572,7 @@ func (ns *noiseServer) handleStreaming(ctx context.Context, w http.ResponseWrite
 		Debug: &tailcfg.Debug{
 			DisableLogTail: true,
 		},
-		Peers:        ns.peers(),
+		Peers:        initialPeers,
 		PacketFilter: tailcfg.FilterAllowAll,
 	}
 
@@ -555,10 +592,21 @@ func (ns *noiseServer) handleStreaming(ctx context.Context, w http.ResponseWrite
 		case <-ctx.Done():
 			return
 		case <-ns.peerUpdate:
+			peers := ns.peers()
 			res := &tailcfg.MapResponse{
 				KeepAlive:   false,
 				ControlTime: ptr.To(time.Now()),
-				Peers:       ns.peers(),
+				Peers:       peers,
+			}
+			if len(peers) == 0 {
+				for peerID := range knownPeerIDs {
+					res.PeersRemoved = append(res.PeersRemoved, peerID)
+				}
+				slices.Sort(res.PeersRemoved)
+			}
+			knownPeerIDs = make(map[tailcfg.NodeID]struct{}, len(peers))
+			for _, peer := range peers {
+				knownPeerIDs[peer.ID] = struct{}{}
 			}
 
 			err := writeMapResponse(w, req, res)

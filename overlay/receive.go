@@ -36,9 +36,43 @@ func NewReceiveOverlay(logger *slog.Logger, hlog Logf, dm *tailcfg.DERPMap) *Rec
 		DerpMap:   dm,
 		SelfPriv:  key.NewNode(),
 		PeerPriv:  key.NewNode(),
-		in:        make(chan *tailcfg.Node, 8),
+		peers:     make(map[string]receivePeer),
+		in:        make(chan PeerUpdate, 8),
 		out:       make(chan *overlayMessage, 8),
 	}
+}
+
+const (
+	peerKeepAliveInterval = 30 * time.Second
+	peerInactiveTimeout   = 2 * time.Minute
+)
+
+type peerTransport uint8
+
+const (
+	peerTransportSTUN peerTransport = iota + 1
+	peerTransportDERP
+)
+
+type peerSource struct {
+	transport peerTransport
+	stunAddr  netip.AddrPort
+	derpKey   key.NodePublic
+}
+
+type receivePeer struct {
+	source   peerSource
+	lastSeen time.Time
+}
+
+type stunPeer struct {
+	sessionID string
+	addr      netip.AddrPort
+}
+
+type derpPeer struct {
+	sessionID string
+	key       key.NodePublic
 }
 
 type Receive struct {
@@ -62,9 +96,10 @@ type Receive struct {
 
 	lastNode atomic.Pointer[tailcfg.Node]
 	peerMu   sync.Mutex
-	peer     string
+	peers    map[string]receivePeer
+	reapOnce sync.Once
 	// in funnels node updates from other peers to us
-	in chan *tailcfg.Node
+	in chan PeerUpdate
 	// out fans out our node updates to peers
 	out chan *overlayMessage
 }
@@ -119,7 +154,7 @@ func (r *Receive) ClientAuth() *ClientAuth {
 	}
 }
 
-func (r *Receive) Recv() <-chan *tailcfg.Node {
+func (r *Receive) Recv() <-chan PeerUpdate {
 	return r.in
 }
 
@@ -140,6 +175,7 @@ func (r *Receive) ListenOverlaySTUN(ctx context.Context) (<-chan struct{}, error
 	if err != nil {
 		return nil, fmt.Errorf("listen STUN: %w", err)
 	}
+	r.startPeerReaper(ctx)
 
 	go func() {
 		<-ctx.Done()
@@ -166,8 +202,6 @@ func (r *Receive) ListenOverlaySTUN(ctx context.Context) (<-chan struct{}, error
 		}
 	}()
 
-	var peer atomic.Pointer[netip.AddrPort]
-
 	go func() {
 		for {
 
@@ -178,18 +212,17 @@ func (r *Receive) ListenOverlaySTUN(ctx context.Context) (<-chan struct{}, error
 				if msg.Typ == messageTypeNodeUpdate {
 					r.lastNode.Store(&msg.Node)
 				}
-				raw, err := json.Marshal(msg)
-				if err != nil {
-					panic("marshal overlay msg: " + err.Error())
-				}
-
-				sealed := r.SelfPriv.SealTo(r.PeerPriv.Public(), raw)
-				peerAddr := peer.Load()
-				if peerAddr == nil {
-					continue
-				}
-				if _, writeErr := conn.WriteToUDPAddrPort(sealed, *peerAddr); writeErr != nil {
-					r.HumanLogf("%s Failed to send updated node over udp: %s", cliui.Timestamp(time.Now()), writeErr)
+				for _, peer := range r.stunPeers() {
+					peerMsg := *msg
+					peerMsg.SessionID = peer.sessionID
+					raw, err := json.Marshal(peerMsg)
+					if err != nil {
+						panic("marshal overlay msg: " + err.Error())
+					}
+					sealed := r.SelfPriv.SealTo(r.PeerPriv.Public(), raw)
+					if _, writeErr := conn.WriteToUDPAddrPort(sealed, peer.addr); writeErr != nil {
+						r.HumanLogf("%s Failed to send updated node over udp: %s", cliui.Timestamp(time.Now()), writeErr)
+					}
 				}
 			}
 		}
@@ -246,15 +279,13 @@ func (r *Receive) ListenOverlaySTUN(ctx context.Context) (<-chan struct{}, error
 				continue
 			}
 
-			res, err := r.handleNextMessage(addr.String(), buf, "STUN")
+			res, err := r.handleNextMessage(peerSource{
+				transport: peerTransportSTUN,
+				stunAddr:  addr,
+			}, buf, "STUN")
 			if err != nil {
 				r.HumanLogf("Failed to handle overlay message: %s", err.Error())
 				continue
-			}
-
-			if peer.Load() == nil {
-				peerAddr := addr
-				peer.Store(&peerAddr)
 			}
 
 			if res != nil {
@@ -277,8 +308,7 @@ func (r *Receive) ListenOverlayDERP(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-
-	var peer atomic.Pointer[key.NodePublic]
+	r.startPeerReaper(ctx)
 
 	go func() {
 		for {
@@ -290,18 +320,17 @@ func (r *Receive) ListenOverlayDERP(ctx context.Context) error {
 				if msg.Typ == messageTypeNodeUpdate {
 					r.lastNode.Store(&msg.Node)
 				}
-				raw, err := json.Marshal(msg)
-				if err != nil {
-					panic("marshal overlay msg: " + err.Error())
-				}
-
-				sealed := r.SelfPriv.SealTo(r.PeerPriv.Public(), raw)
-				derpKey := peer.Load()
-				if derpKey == nil {
-					continue
-				}
-				if sendErr := c.Send(*derpKey, sealed); sendErr != nil {
-					r.HumanLogf("Send updated node over DERP: %s", sendErr)
+				for _, peer := range r.derpPeers() {
+					peerMsg := *msg
+					peerMsg.SessionID = peer.sessionID
+					raw, err := json.Marshal(peerMsg)
+					if err != nil {
+						panic("marshal overlay msg: " + err.Error())
+					}
+					sealed := r.SelfPriv.SealTo(r.PeerPriv.Public(), raw)
+					if sendErr := c.Send(peer.key, sealed); sendErr != nil {
+						r.HumanLogf("Send updated node over DERP: %s", sendErr)
+					}
 				}
 			}
 		}
@@ -315,15 +344,13 @@ func (r *Receive) ListenOverlayDERP(ctx context.Context) error {
 
 		switch msg := msg.(type) {
 		case derp.ReceivedPacket:
-			res, err := r.handleNextMessage(msg.Source.String(), msg.Data, "DERP")
+			res, err := r.handleNextMessage(peerSource{
+				transport: peerTransportDERP,
+				derpKey:   msg.Source,
+			}, msg.Data, "DERP")
 			if err != nil {
 				r.HumanLogf("Failed to handle overlay message from %s: %s", msg.Source.ShortString(), err.Error())
 				continue
-			}
-
-			if peer.Load() == nil {
-				derpKey := msg.Source
-				peer.Store(&derpKey)
 			}
 
 			if res != nil {
@@ -333,11 +360,13 @@ func (r *Receive) ListenOverlayDERP(ctx context.Context) error {
 					return err
 				}
 			}
+		case derp.PeerGoneMessage:
+			r.removeDERPPeers(msg.Peer)
 		}
 	}
 }
 
-func (r *Receive) handleNextMessage(source string, msg []byte, system string) ([]byte, error) {
+func (r *Receive) handleNextMessage(source peerSource, msg []byte, system string) ([]byte, error) {
 	cleartext, ok := r.SelfPriv.OpenFrom(r.PeerPriv.Public(), msg)
 	if !ok {
 		return nil, errors.New("message failed decryption")
@@ -348,11 +377,15 @@ func (r *Receive) handleNextMessage(source string, msg []byte, system string) ([
 	if err != nil {
 		return nil, fmt.Errorf("unmarshal overlay message: %w", err)
 	}
-	if err := r.acceptPeer(source, ovMsg.Typ); err != nil {
+	removed, err := r.trackPeer(ovMsg.SessionID, source, ovMsg.Typ, time.Now())
+	if err != nil {
 		return nil, err
 	}
+	if removed {
+		return nil, nil
+	}
 
-	res := overlayMessage{}
+	res := overlayMessage{SessionID: ovMsg.SessionID}
 	switch ovMsg.Typ {
 	case messageTypePing:
 		res.Typ = messageTypePong
@@ -375,7 +408,7 @@ func (r *Receive) handleNextMessage(source string, msg []byte, system string) ([
 		r.HumanLogf("%s Received connection request over %s from %s", cliui.Timestamp(time.Now()), system, cliui.Keyword(fmt.Sprintf("%s@%s", username, hostname)))
 	case messageTypeNodeUpdate:
 		r.Logger.Debug("received updated node", slog.String("node_key", ovMsg.Node.Key.String()))
-		r.in <- &ovMsg.Node
+		r.in <- PeerUpdate{ID: ovMsg.SessionID, Node: ovMsg.Node.Clone()}
 		res.Typ = messageTypeNodeUpdate
 		if lastNode := r.lastNode.Load(); lastNode != nil {
 			res.Node = *lastNode
@@ -396,22 +429,106 @@ func (r *Receive) handleNextMessage(source string, msg []byte, system string) ([
 	return sealed, nil
 }
 
-func (r *Receive) acceptPeer(source string, typ messageType) error {
-	if source == "" {
-		return errors.New("overlay peer source is empty")
+func (r *Receive) trackPeer(sessionID string, source peerSource, typ messageType, now time.Time) (bool, error) {
+	if sessionID == "" {
+		return false, errors.New("overlay session ID is empty")
 	}
+	switch source.transport {
+	case peerTransportSTUN:
+		if !source.stunAddr.IsValid() {
+			return false, errors.New("overlay STUN peer address is invalid")
+		}
+	case peerTransportDERP:
+		if source.derpKey.IsZero() {
+			return false, errors.New("overlay DERP peer key is empty")
+		}
+	default:
+		return false, errors.New("overlay peer transport is invalid")
+	}
+	r.peerMu.Lock()
+	if r.peers == nil {
+		r.peers = make(map[string]receivePeer)
+	}
+	_, exists := r.peers[sessionID]
+	if typ == messageTypeGoodbye {
+		if exists {
+			delete(r.peers, sessionID)
+			r.in <- PeerUpdate{ID: sessionID}
+		}
+		r.peerMu.Unlock()
+		return true, nil
+	}
+	if !exists {
+		if typ != messageTypeHello {
+			r.peerMu.Unlock()
+			return false, errors.New("first overlay message must be hello")
+		}
+	}
+	r.peers[sessionID] = receivePeer{source: source, lastSeen: now}
+	r.peerMu.Unlock()
+	return false, nil
+}
 
+func (r *Receive) stunPeers() []stunPeer {
 	r.peerMu.Lock()
 	defer r.peerMu.Unlock()
-	if r.peer == "" {
-		if typ != messageTypeHello {
-			return errors.New("first overlay message must be hello")
+	peers := make([]stunPeer, 0, len(r.peers))
+	for sessionID, peer := range r.peers {
+		if peer.source.transport == peerTransportSTUN {
+			peers = append(peers, stunPeer{sessionID: sessionID, addr: peer.source.stunAddr})
 		}
-		r.peer = source
-		return nil
 	}
-	if r.peer != source {
-		return errors.New("another overlay peer is already connected")
+	return peers
+}
+
+func (r *Receive) derpPeers() []derpPeer {
+	r.peerMu.Lock()
+	defer r.peerMu.Unlock()
+	peers := make([]derpPeer, 0, len(r.peers))
+	for sessionID, peer := range r.peers {
+		if peer.source.transport == peerTransportDERP {
+			peers = append(peers, derpPeer{sessionID: sessionID, key: peer.source.derpKey})
+		}
 	}
-	return nil
+	return peers
+}
+
+func (r *Receive) removeDERPPeers(peerKey key.NodePublic) {
+	r.peerMu.Lock()
+	for sessionID, peer := range r.peers {
+		if peer.source.transport == peerTransportDERP && peer.source.derpKey == peerKey {
+			delete(r.peers, sessionID)
+			r.in <- PeerUpdate{ID: sessionID}
+		}
+	}
+	r.peerMu.Unlock()
+}
+
+func (r *Receive) expirePeers(now time.Time) {
+	cutoff := now.Add(-peerInactiveTimeout)
+	r.peerMu.Lock()
+	for sessionID, peer := range r.peers {
+		if !peer.lastSeen.After(cutoff) {
+			delete(r.peers, sessionID)
+			r.in <- PeerUpdate{ID: sessionID}
+		}
+	}
+	r.peerMu.Unlock()
+}
+
+func (r *Receive) startPeerReaper(ctx context.Context) {
+	r.reapOnce.Do(func() {
+		go func() {
+			ticker := time.NewTicker(peerKeepAliveInterval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case now := <-ticker.C:
+					r.expirePeers(now)
+				}
+			}
+		}()
+	})
 }

@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/coder/wush/overlay"
 	"tailscale.com/client/tailscale"
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/ipn/store"
@@ -22,11 +23,11 @@ import (
 )
 
 type integrationOverlay struct {
-	recv    chan *tailcfg.Node
+	recv    chan overlay.PeerUpdate
 	updates chan *tailcfg.Node
 }
 
-func (o *integrationOverlay) Recv() <-chan *tailcfg.Node {
+func (o *integrationOverlay) Recv() <-chan overlay.PeerUpdate {
 	return o.recv
 }
 
@@ -43,7 +44,7 @@ func TestUpstreamTSNetHandshake(t *testing.T) {
 	defer cancel()
 
 	ov := &integrationOverlay{
-		recv:    make(chan *tailcfg.Node),
+		recv:    make(chan overlay.PeerUpdate),
 		updates: make(chan *tailcfg.Node, 1),
 	}
 	s, err := NewServer(ctx, slog.Default(), ov, &tailcfg.DERPMap{})
@@ -93,7 +94,7 @@ func TestUpstreamTSNetHandshake(t *testing.T) {
 	peerKey := key.NewNode().Public()
 	peerIP := netip.MustParseAddr("fd7a:115c:a1e0::2")
 	peerPrefix := netip.PrefixFrom(peerIP, peerIP.BitLen())
-	ov.recv <- &tailcfg.Node{
+	ov.recv <- overlay.PeerUpdate{ID: "peer-a", Node: &tailcfg.Node{
 		ID:                tailcfg.NodeID(2),
 		StableID:          tailcfg.StableNodeID("cached-peer"),
 		Name:              "cached-peer",
@@ -105,18 +106,39 @@ func TestUpstreamTSNetHandshake(t *testing.T) {
 		AllowedIPs:        []netip.Prefix{peerPrefix},
 		Online:            ptr.To(true),
 		MachineAuthorized: true,
-	}
+	}}
+	secondPeerKey := key.NewNode().Public()
+	secondPeerIP := netip.MustParseAddr("fd7a:115c:a1e0::3")
+	secondPeerPrefix := netip.PrefixFrom(secondPeerIP, secondPeerIP.BitLen())
+	ov.recv <- overlay.PeerUpdate{ID: "peer-b", Node: &tailcfg.Node{
+		ID:                tailcfg.NodeID(3),
+		StableID:          tailcfg.StableNodeID("second-peer"),
+		Name:              "second-peer",
+		User:              tailcfg.UserID(123),
+		Machine:           key.NewMachine().Public(),
+		Key:               secondPeerKey,
+		DiscoKey:          key.NewDisco().Public(),
+		Addresses:         []netip.Prefix{secondPeerPrefix},
+		AllowedIPs:        []netip.Prefix{secondPeerPrefix},
+		Online:            ptr.To(true),
+		MachineAuthorized: true,
+	}}
 	waitForIntegrationStatus(t, ctx, lc, func(status *ipnstate.Status) bool {
-		return status.Peer[peerKey] != nil
-	}, "initial tsnet to receive the overlay peer")
+		return status.Peer[peerKey] != nil && status.Peer[secondPeerKey] != nil
+	}, "initial tsnet to receive both overlay peers")
+
+	ov.recv <- overlay.PeerUpdate{ID: "peer-a"}
+	waitForIntegrationStatus(t, ctx, lc, func(status *ipnstate.Status) bool {
+		return status.Peer[peerKey] == nil && status.Peer[secondPeerKey] != nil
+	}, "initial tsnet to remove the disconnected overlay peer")
 
 	if err := ts.Close(); err != nil {
 		t.Fatal(err)
 	}
 	_, reconnectedClient := startIntegrationTSNet(t, s, "reconnected")
 	waitForIntegrationStatus(t, ctx, reconnectedClient, func(status *ipnstate.Status) bool {
-		return status.Peer[peerKey] != nil
-	}, "reconnected tsnet to receive the cached overlay peer")
+		return status.Peer[peerKey] == nil && status.Peer[secondPeerKey] != nil
+	}, "reconnected tsnet to receive only the active cached overlay peer")
 }
 
 func startIntegrationTSNet(t *testing.T, s *server, name string) (*tsnet.Server, *tailscale.LocalClient) {

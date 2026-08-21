@@ -94,6 +94,7 @@ func sendOverlayMW(opts *sendOverlayOpts, send **overlay.Send, logger *slog.Logg
 			newSend.Auth.PrintDebug(*logf, dm)
 
 			*send = newSend
+			defer newSend.Close()
 			return next(i)
 		}
 	}

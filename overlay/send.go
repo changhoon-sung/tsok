@@ -13,9 +13,11 @@ import (
 	"net/netip"
 	"os"
 	"os/user"
+	"sync"
 	"time"
 
 	"github.com/coder/wush/cliui"
+	"github.com/google/uuid"
 	"tailscale.com/derp"
 	"tailscale.com/derp/derphttp"
 	"tailscale.com/net/netmon"
@@ -25,10 +27,12 @@ import (
 
 func NewSendOverlay(logger *slog.Logger, dm *tailcfg.DERPMap) *Send {
 	s := &Send{
-		derpMap: dm,
-		in:      make(chan *tailcfg.Node, 8),
-		out:     make(chan *overlayMessage, 8),
-		SelfIP:  randv6(),
+		derpMap:   dm,
+		in:        make(chan PeerUpdate, 8),
+		out:       make(chan *overlayMessage, 8),
+		done:      make(chan struct{}),
+		SelfIP:    randv6(),
+		SessionID: uuid.NewString(),
 	}
 	return s
 }
@@ -38,26 +42,33 @@ type Send struct {
 	STUNIPOverride netip.Addr
 	derpMap        *tailcfg.DERPMap
 
-	SelfIP netip.Addr
+	SelfIP    netip.Addr
+	SessionID string
 
 	Auth ClientAuth
 
-	in  chan *tailcfg.Node
+	in  chan PeerUpdate
 	out chan *overlayMessage
+
+	closeMu   sync.Mutex
+	closeFunc func()
+	closed    bool
+	done      chan struct{}
 }
 
 func (s *Send) IPs() []netip.Addr {
 	return []netip.Addr{s.SelfIP}
 }
 
-func (s *Send) Recv() <-chan *tailcfg.Node {
+func (s *Send) Recv() <-chan PeerUpdate {
 	return s.in
 }
 
 func (s *Send) SendTailscaleNodeUpdate(node *tailcfg.Node) {
 	s.out <- &overlayMessage{
-		Typ:  messageTypeNodeUpdate,
-		Node: *node.Clone(),
+		Typ:       messageTypeNodeUpdate,
+		SessionID: s.SessionID,
+		Node:      *node.Clone(),
 	}
 }
 
@@ -66,11 +77,6 @@ func (s *Send) ListenOverlaySTUN(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("listen STUN: %w", err)
 	}
-
-	go func() {
-		<-ctx.Done()
-		_ = conn.Close()
-	}()
 
 	sealed := s.newHelloPacket()
 	receiverAddr := s.Auth.ReceiverStunAddr
@@ -83,11 +89,31 @@ func (s *Send) ListenOverlaySTUN(ctx context.Context) error {
 		return fmt.Errorf("send overlay hello over STUN: %w", err)
 	}
 
-	keepAlive := time.NewTicker(30 * time.Second)
+	s.setCloseFunc(func() {
+		_ = conn.SetWriteDeadline(time.Now().Add(time.Second))
+		_, _ = conn.WriteToUDPAddrPort(s.sealMessage(overlayMessage{
+			Typ:       messageTypeGoodbye,
+			SessionID: s.SessionID,
+		}), receiverAddr)
+		_ = conn.Close()
+	})
+	defer s.Close()
+	go func() {
+		select {
+		case <-ctx.Done():
+			s.Close()
+		case <-s.done:
+		}
+	}()
+
+	keepAlive := time.NewTicker(peerKeepAliveInterval)
+	defer keepAlive.Stop()
 
 	go func() {
 		for {
 			select {
+			case <-s.done:
+				return
 			case <-ctx.Done():
 				return
 			case msg := <-s.out:
@@ -105,7 +131,8 @@ func (s *Send) ListenOverlaySTUN(ctx context.Context) error {
 
 			case <-keepAlive.C:
 				msg := overlayMessage{
-					Typ: messageTypePing,
+					Typ:       messageTypePing,
+					SessionID: s.SessionID,
 				}
 				raw, err := json.Marshal(msg)
 				if err != nil {
@@ -165,9 +192,30 @@ func (s *Send) ListenOverlayDERP(ctx context.Context) error {
 		return fmt.Errorf("send overlay hello over derp: %w", err)
 	}
 
+	s.setCloseFunc(func() {
+		_ = c.Send(s.Auth.ReceiverPublicKey, s.sealMessage(overlayMessage{
+			Typ:       messageTypeGoodbye,
+			SessionID: s.SessionID,
+		}))
+		_ = c.Close()
+	})
+	defer s.Close()
+	go func() {
+		select {
+		case <-ctx.Done():
+			s.Close()
+		case <-s.done:
+		}
+	}()
+
+	keepAlive := time.NewTicker(peerKeepAliveInterval)
+	defer keepAlive.Stop()
+
 	go func() {
 		for {
 			select {
+			case <-s.done:
+				return
 			case <-ctx.Done():
 				return
 			case msg := <-s.out:
@@ -180,6 +228,14 @@ func (s *Send) ListenOverlayDERP(ctx context.Context) error {
 				err = c.Send(s.Auth.ReceiverPublicKey, sealed)
 				if err != nil {
 					fmt.Printf("send response over derp: %s\n", err)
+					return
+				}
+			case <-keepAlive.C:
+				err = c.Send(s.Auth.ReceiverPublicKey, s.sealMessage(overlayMessage{
+					Typ:       messageTypePing,
+					SessionID: s.SessionID,
+				}))
+				if err != nil {
 					return
 				}
 			}
@@ -229,7 +285,8 @@ func (s *Send) newHelloPacket() []byte {
 	hostname, _ = os.Hostname()
 
 	raw, err := json.Marshal(overlayMessage{
-		Typ: messageTypeHello,
+		Typ:       messageTypeHello,
+		SessionID: s.SessionID,
 		HostInfo: HostInfo{
 			Username: username,
 			Hostname: hostname,
@@ -254,17 +311,23 @@ func (s *Send) handleNextMessage(msg []byte) (resRaw []byte, _ error) {
 	if err != nil {
 		return nil, fmt.Errorf("unmarshal overlay message: %w", err)
 	}
+	// Version 1 servers do not echo SessionID. Accept an empty value during the
+	// documented client-first rolling upgrade, while requiring an exact match
+	// whenever the server supports session-aware multi-peer routing.
+	if ovMsg.SessionID != "" && ovMsg.SessionID != s.SessionID {
+		return nil, errors.New("overlay response belongs to another session")
+	}
 
-	res := overlayMessage{}
+	res := overlayMessage{SessionID: s.SessionID}
 	switch ovMsg.Typ {
 	case messageTypePing:
 		res.Typ = messageTypePong
 	case messageTypePong:
 		// do nothing
 	case messageTypeHelloResponse:
-		s.in <- &ovMsg.Node
+		s.in <- PeerUpdate{ID: s.Auth.ReceiverPublicKey.String(), Node: ovMsg.Node.Clone()}
 	case messageTypeNodeUpdate:
-		s.in <- &ovMsg.Node
+		s.in <- PeerUpdate{ID: s.Auth.ReceiverPublicKey.String(), Node: ovMsg.Node.Clone()}
 	}
 
 	if res.Typ == 0 {
@@ -278,4 +341,42 @@ func (s *Send) handleNextMessage(msg []byte) (resRaw []byte, _ error) {
 
 	sealed := s.Auth.OverlayPrivateKey.SealTo(s.Auth.ReceiverPublicKey, raw)
 	return sealed, nil
+}
+
+func (s *Send) sealMessage(msg overlayMessage) []byte {
+	raw, err := json.Marshal(msg)
+	if err != nil {
+		panic("marshal overlay message: " + err.Error())
+	}
+	return s.Auth.OverlayPrivateKey.SealTo(s.Auth.ReceiverPublicKey, raw)
+}
+
+func (s *Send) setCloseFunc(closeFunc func()) {
+	s.closeMu.Lock()
+	if s.closed {
+		s.closeMu.Unlock()
+		closeFunc()
+		return
+	}
+	s.closeFunc = closeFunc
+	s.closeMu.Unlock()
+}
+
+// Close sends a best-effort disconnect message and releases the overlay
+// transport. It is safe to call more than once.
+func (s *Send) Close() {
+	s.closeMu.Lock()
+	if s.closed {
+		s.closeMu.Unlock()
+		return
+	}
+	s.closed = true
+	closeFunc := s.closeFunc
+	if s.done != nil {
+		close(s.done)
+	}
+	s.closeMu.Unlock()
+	if closeFunc != nil {
+		closeFunc()
+	}
 }

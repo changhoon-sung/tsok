@@ -27,6 +27,7 @@ import (
 
 func NewSendOverlay(logger *slog.Logger, dm *tailcfg.DERPMap) *Send {
 	s := &Send{
+		Logger:    logger,
 		derpMap:   dm,
 		in:        make(chan PeerUpdate, 8),
 		out:       make(chan *overlayMessage, 8),
@@ -153,6 +154,14 @@ func (s *Send) ListenOverlaySTUN(ctx context.Context) error {
 		buf := make([]byte, 4<<10)
 		n, addr, err := conn.ReadFromUDPAddrPort(buf)
 		if err != nil {
+			select {
+			case <-s.done:
+				return nil
+			default:
+			}
+			if errors.Is(err, net.ErrClosed) {
+				return nil
+			}
 			s.Logger.Error("read from STUN; exiting", "err", err)
 			return err
 		}

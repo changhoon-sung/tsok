@@ -32,6 +32,16 @@ func TestSendRejectsMalformedOverlayMessage(t *testing.T) {
 	}
 }
 
+func TestNewSendOverlayInitializesLogger(t *testing.T) {
+	t.Parallel()
+
+	logger := slog.Default()
+	send := NewSendOverlay(logger, &tailcfg.DERPMap{})
+	if send.Logger != logger {
+		t.Fatal("send overlay did not retain its logger")
+	}
+}
+
 func TestSendIgnoresLegacyWebRTCResponseField(t *testing.T) {
 	t.Parallel()
 

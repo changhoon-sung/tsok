@@ -79,13 +79,22 @@ auth key concurrently; stopped processes are removed from the active peer set.
 Building from source requires Go 1.27 or newer. From the repository root:
 
 ```bash
-mkdir -p dist
-go build -trimpath -o dist/wush ./cmd/wush
-./dist/wush --help
+make build
+./dist/wush_$(go env GOOS)_$(go env GOARCH) --help
 ```
 
-The resulting `dist/wush` is a self-contained binary for the current operating
-system and architecture.
+Every output filename includes its operating system and architecture. Build
+both supported Linux binaries, both macOS binaries, or the complete release
+matrix with:
+
+```bash
+make linux
+make darwin
+make release-builds
+```
+
+The release matrix contains `wush_{linux,darwin}_{amd64,arm64}`. Run
+`make test` to execute the test suite with the race detector.
 
 ## Install
 

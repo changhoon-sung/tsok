@@ -80,7 +80,7 @@ func rsyncCmd() *serpent.Command {
 			},
 			{
 				Flag:        "wait-p2p",
-				Description: "Waits for the connection to be p2p.",
+				Description: waitDirectDescription,
 				Default:     "false",
 				Value:       serpent.BoolOf(&overlayOpts.waitP2P),
 			},

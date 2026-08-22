@@ -121,6 +121,8 @@ type sendOverlayOpts struct {
 	waitP2P    bool
 }
 
+const waitDirectDescription = "Waits until a direct connection is established instead of continuing over a relay."
+
 func cpCmd() *serpent.Command {
 	var (
 		verbose   bool
@@ -256,7 +258,7 @@ func cpCmd() *serpent.Command {
 			},
 			{
 				Flag:        "wait-p2p",
-				Description: "Waits for the connection to be p2p.",
+				Description: waitDirectDescription,
 				Default:     "false",
 				Value:       serpent.BoolOf(&overlayOpts.waitP2P),
 			},

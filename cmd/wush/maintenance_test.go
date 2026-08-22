@@ -289,6 +289,98 @@ func TestPeerConnectionLog(t *testing.T) {
 	}
 }
 
+func TestWaitUntilHasPeerHasIPAndPathReportsRelay(t *testing.T) {
+	t.Parallel()
+
+	peerIP := netip.MustParseAddr("fd7a:115c:a1e0::2")
+	client := &fakePeerStatusClient{status: peerStatus(peerIP, "lax", "")}
+	var logs []string
+	logf := func(format string, args ...any) {
+		logs = append(logs, fmt.Sprintf(format, args...))
+	}
+
+	gotIP, relay, direct, err := waitUntilHasPeerHasIPAndPath(context.Background(), logf, client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotIP != peerIP || relay != "lax" || direct {
+		t.Fatalf("peer path = (%s, %q, %v), want (%s, %q, false)", gotIP, relay, direct, peerIP, "lax")
+	}
+	if got := strings.Join(logs, "\n"); !strings.Contains(got, "Peer reachable via relay") || !strings.Contains(got, "lax") {
+		t.Fatalf("logs = %q, want relay status", got)
+	}
+}
+
+func TestNegotiateSSHDirectConnection(t *testing.T) {
+	t.Parallel()
+
+	peerIP := netip.MustParseAddr("fd7a:115c:a1e0::2")
+	client := &fakePeerStatusClient{
+		status: peerStatus(peerIP, "lax", ""),
+		ping:   &ipnstate.PingResult{Endpoint: "192.0.2.1:41641"},
+	}
+	var logs []string
+	logf := func(format string, args ...any) {
+		logs = append(logs, fmt.Sprintf(format, args...))
+	}
+
+	if err := negotiateSSHDirectConnection(context.Background(), logf, client, "lax", false, time.Second); err != nil {
+		t.Fatal(err)
+	}
+	got := strings.Join(logs, "\n")
+	if !strings.Contains(got, "Negotiating direct connection...") || !strings.Contains(got, "Peer connection: direct") {
+		t.Fatalf("logs = %q, want negotiation and direct status", got)
+	}
+}
+
+func TestNegotiateSSHDirectConnectionFallsBackToRelay(t *testing.T) {
+	t.Parallel()
+
+	peerIP := netip.MustParseAddr("fd7a:115c:a1e0::2")
+	client := &fakePeerStatusClient{
+		status:  peerStatus(peerIP, "lax", ""),
+		pingErr: context.DeadlineExceeded,
+	}
+	var logs []string
+	logf := func(format string, args ...any) {
+		logs = append(logs, fmt.Sprintf(format, args...))
+	}
+
+	if err := negotiateSSHDirectConnection(context.Background(), logf, client, "lax", false, time.Millisecond); err != nil {
+		t.Fatal(err)
+	}
+	got := strings.Join(logs, "\n")
+	if !strings.Contains(got, "Direct connection unavailable; continuing via relay") || !strings.Contains(got, "lax") {
+		t.Fatalf("logs = %q, want relay fallback status", got)
+	}
+}
+
+type fakePeerStatusClient struct {
+	status  *ipnstate.Status
+	ping    *ipnstate.PingResult
+	pingErr error
+}
+
+func (client *fakePeerStatusClient) Status(context.Context) (*ipnstate.Status, error) {
+	return client.status, nil
+}
+
+func (client *fakePeerStatusClient) Ping(context.Context, netip.Addr, tailcfg.PingType) (*ipnstate.PingResult, error) {
+	return client.ping, client.pingErr
+}
+
+func peerStatus(peerIP netip.Addr, relay, directEndpoint string) *ipnstate.Status {
+	nodeKey := key.NewNode().Public()
+	return &ipnstate.Status{Peer: map[key.NodePublic]*ipnstate.PeerStatus{
+		nodeKey: {
+			TailscaleIPs: []netip.Addr{peerIP},
+			Relay:        relay,
+			CurAddr:      directEndpoint,
+			Active:       true,
+		},
+	}}
+}
+
 func TestBicopyCancellationClosesConnections(t *testing.T) {
 	t.Parallel()
 

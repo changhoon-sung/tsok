@@ -16,6 +16,9 @@ shells over a peer-to-peer WireGuard connection. It's similar to
 > 1 CLI auth keys, while older clients reject version 2 keys before connecting.
 > Upgrade clients before servers in mixed-version deployments.
 
+This is an independent fork of [`coder/wush`](https://github.com/coder/wush).
+It is not affiliated with or endorsed by Coder Technologies.
+
 ## Basic Usage
 
 On the host machine:
@@ -139,3 +142,10 @@ way more functionality.
 1. [Tailscale](https://tailscale.com)
 1. [Headscale](https://github.com/juanfont/headscale)
 1. [WireGuard-go](https://github.com/WireGuard/wireguard-go)
+
+## License
+
+The original wush source is dedicated to the public domain under
+[CC0 1.0](LICENSE). Third-party components retain their respective licenses.
+Run `wush licenses` to show the dependency license report URL for the exact
+commit used to build the CLI.

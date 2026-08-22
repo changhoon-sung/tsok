@@ -5,9 +5,11 @@ package xssh
 import (
 	"context"
 	"errors"
+	"io"
 	"os"
 	"os/exec"
 	"syscall"
+	"time"
 )
 
 func configureCommand(cmd *exec.Cmd, hasPTY bool) {
@@ -28,6 +30,21 @@ func configureCommand(cmd *exec.Cmd, hasPTY bool) {
 	}
 }
 
-func waitPTYCommand(_ context.Context, cmd *exec.Cmd) error {
-	return cmd.Wait()
+func waitPTYCommand(ctx context.Context, cmd *exec.Cmd) error {
+	err := cmd.Wait()
+
+	// charm SSH copies the PTY master to the SSH channel in an internal
+	// goroutine. Close our parent-side slave after the child exits so that copy
+	// sees EOF, then give it a bounded window to flush the final PTY bytes before
+	// the session handler returns and closes the SSH channel.
+	if closer, ok := cmd.Stdout.(io.Closer); ok {
+		_ = closer.Close()
+	}
+	timer := time.NewTimer(100 * time.Millisecond)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+	case <-timer.C:
+	}
+	return err
 }

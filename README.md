@@ -60,6 +60,16 @@ $ WUSH_AUTH_KEY=<auth-key> ssh -o 'ProxyCommand=wush connect --stdio --quiet 127
 $ ssh wush
 ```
 
+Before starting `wush ssh`, the client checks its current path. If it is already
+direct, the client reports `Peer connection: direct`. If the peer is first
+reachable over DERP, it reports `Peer reachable via relay (<region>)` and
+`Negotiating direct connection...`, then probes for a direct UDP path for up to
+five seconds. It either reports `Peer connection: direct` or
+`Direct connection unavailable; continuing via relay (<region>)`.
+`--wait-p2p` keeps waiting until a direct path is available instead of falling
+back to the relay. `--quiet` suppresses these diagnostics and skips the default
+bounded check unless `--wait-p2p` is also set.
+
 `wush connect --stdio` bridges stdin and stdout to a TCP port on the host's
 loopback interface. This makes it suitable for OpenSSH `ProxyCommand` and other
 clients that support a stdio transport, while keeping features such as agent

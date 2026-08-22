@@ -2,12 +2,13 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/netip"
 	"time"
 
-	"tailscale.com/client/tailscale"
+	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/tailcfg"
 
 	"github.com/coder/serpent"
@@ -16,6 +17,13 @@ import (
 	"github.com/coder/wush/tsserver"
 	xssh "github.com/coder/wush/xssh"
 )
+
+const sshDirectNegotiationTimeout = 5 * time.Second
+
+type peerStatusClient interface {
+	Status(context.Context) (*ipnstate.Status, error)
+	Ping(context.Context, netip.Addr, tailcfg.PingType) (*ipnstate.PingResult, error)
+}
 
 func sshCmd() *serpent.Command {
 	var (
@@ -73,14 +81,13 @@ func sshCmd() *serpent.Command {
 				return err
 			}
 
-			ip, err := waitUntilHasPeerHasIP(ctx, logf, lc)
+			ip, relay, direct, err := waitUntilHasPeerHasIPAndPath(ctx, logf, lc)
 			if err != nil {
 				return err
 			}
 
-			if overlayOpts.waitP2P {
-				err := waitUntilHasP2P(ctx, logf, lc)
-				if err != nil {
+			if !direct && (!quiet || overlayOpts.waitP2P) {
+				if err := negotiateSSHDirectConnection(ctx, logf, lc, relay, overlayOpts.waitP2P, sshDirectNegotiationTimeout); err != nil {
 					return err
 				}
 			}
@@ -109,7 +116,7 @@ func sshCmd() *serpent.Command {
 			},
 			{
 				Flag:        "wait-p2p",
-				Description: "Waits for the connection to be p2p.",
+				Description: waitDirectDescription,
 				Default:     "false",
 				Value:       serpent.BoolOf(&overlayOpts.waitP2P),
 			},
@@ -124,11 +131,16 @@ func sshCmd() *serpent.Command {
 	}
 }
 
-func waitUntilHasPeerHasIP(ctx context.Context, logF func(str string, args ...any), lc *tailscale.LocalClient) (netip.Addr, error) {
+func waitUntilHasPeerHasIP(ctx context.Context, logF func(str string, args ...any), lc peerStatusClient) (netip.Addr, error) {
+	ip, _, _, err := waitUntilHasPeerHasIPAndPath(ctx, logF, lc)
+	return ip, err
+}
+
+func waitUntilHasPeerHasIPAndPath(ctx context.Context, logF func(str string, args ...any), lc peerStatusClient) (netip.Addr, string, bool, error) {
 	for {
 		select {
 		case <-ctx.Done():
-			return netip.Addr{}, ctx.Err()
+			return netip.Addr{}, "", false, ctx.Err()
 		case <-time.After(time.Second):
 		}
 
@@ -152,71 +164,75 @@ func waitUntilHasPeerHasIP(ctx context.Context, logF func(str string, args ...an
 			continue
 		}
 
-		if peer.Relay == "" {
-			logF("peer no relay")
-			continue
-		}
-
-		logF("Peer active with relay %s", cliui.Code(peer.Relay))
-
 		if len(peer.TailscaleIPs) == 0 {
 			logF("peer has no ips (developer error)")
 			continue
 		}
 
-		return peer.TailscaleIPs[0], nil
+		if peer.CurAddr != "" {
+			logF("Peer connection: %s", cliui.Code("direct"))
+			return peer.TailscaleIPs[0], peer.Relay, true, nil
+		}
+		if peer.Relay == "" {
+			logF("peer has no connection path yet")
+			continue
+		}
+
+		logF("Peer reachable via relay (%s)", cliui.Code(peer.Relay))
+		return peer.TailscaleIPs[0], peer.Relay, false, nil
 	}
 }
 
-func waitUntilHasP2P(ctx context.Context, logF func(str string, args ...any), lc *tailscale.LocalClient) error {
+func negotiateSSHDirectConnection(ctx context.Context, logF func(str string, args ...any), lc peerStatusClient, relay string, wait bool, timeout time.Duration) error {
+	logF("Negotiating direct connection...")
+	if wait {
+		return waitUntilHasP2P(ctx, logF, lc)
+	}
+
+	negotiationCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	if err := waitUntilHasP2P(negotiationCtx, logF, lc); err != nil {
+		if errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil {
+			logF("Direct connection unavailable; continuing via relay (%s)", cliui.Code(relay))
+			return nil
+		}
+		return err
+	}
+	return nil
+}
+
+func waitUntilHasP2P(ctx context.Context, logF func(str string, args ...any), lc peerStatusClient) error {
 	for {
+		stat, err := lc.Status(ctx)
+		if err != nil {
+			logF("error getting lc status: %s", err)
+		} else {
+			peers := stat.Peers()
+			if len(peers) == 0 {
+				logF("No peer yet")
+			} else if peer, ok := stat.Peer[peers[0]]; !ok {
+				logF("no peer found in map while waiting p2p (developer error)")
+			} else if len(peer.TailscaleIPs) == 0 {
+				logF("peer has no ips (developer error)")
+			} else {
+				pingCancel, cancel := context.WithTimeout(ctx, time.Second)
+				pong, pingErr := lc.Ping(pingCancel, peer.TailscaleIPs[0], tailcfg.PingDisco)
+				cancel()
+				if pingErr != nil {
+					if !errors.Is(pingErr, context.DeadlineExceeded) && !errors.Is(pingErr, context.Canceled) {
+						logF("ping failed: %s", pingErr)
+					}
+				} else if pong.Endpoint != "" {
+					logF("Peer connection: %s", cliui.Code("direct"))
+					return nil
+				}
+			}
+		}
+
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-time.After(time.Second):
 		}
-
-		stat, err := lc.Status(ctx)
-		if err != nil {
-			logF("error getting lc status: %s", err)
-			continue
-		}
-
-		peers := stat.Peers()
-		if len(peers) == 0 {
-			logF("No peer yet")
-			continue
-		}
-		peer, ok := stat.Peer[peers[0]]
-		if !ok {
-			logF("no peer found in map while waiting p2p (developer error)")
-			continue
-		}
-
-		if peer.Relay == "" {
-			logF("peer no relay")
-			continue
-		}
-
-		if len(peer.TailscaleIPs) == 0 {
-			logF("peer has no ips (developer error)")
-			continue
-		}
-
-		pingCancel, cancel := context.WithTimeout(ctx, time.Second)
-		pong, err := lc.Ping(pingCancel, peer.TailscaleIPs[0], tailcfg.PingDisco)
-		cancel()
-		if err != nil {
-			logF("ping failed: %s", err)
-			continue
-		}
-
-		if pong.Endpoint == "" {
-			logF("Not p2p yet")
-			continue
-		}
-
-		logF("Peer active over p2p %s", cliui.Code(pong.Endpoint))
-		return nil
 	}
 }

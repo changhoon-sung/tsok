@@ -143,7 +143,8 @@ func TestUpstreamTSNetHandshake(t *testing.T) {
 
 func startIntegrationTSNet(t *testing.T, s *server, name string) (*tsnet.Server, *tailscale.LocalClient) {
 	t.Helper()
-	state, err := store.New(t.Logf, "mem:wush-upstream-integration-"+name)
+	logf := func(string, ...any) {}
+	state, err := store.New(logf, "mem:wush-upstream-integration-"+name)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -154,8 +155,8 @@ func startIntegrationTSNet(t *testing.T, s *server, name string) (*tsnet.Server,
 		Ephemeral:  true,
 		AuthKey:    "integration-test-" + name,
 		ControlURL: s.ControlURL(),
-		Logf:       t.Logf,
-		UserLogf:   t.Logf,
+		Logf:       logf,
+		UserLogf:   logf,
 	}
 	t.Cleanup(func() { _ = ts.Close() })
 	if err := ts.Start(); err != nil {

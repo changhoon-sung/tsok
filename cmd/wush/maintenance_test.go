@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"tailscale.com/ipn/ipnstate"
+	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
 )
 
@@ -170,9 +171,13 @@ Or add this block to ~/.ssh/config:
 Host wush
   HostName wush
   User alice
-  ProxyCommand env WUSH_AUTH_KEY=test-auth-key wush connect --stdio --quiet 127.0.0.1:%p`
+  ProxyCommand env WUSH_AUTH_KEY=test-auth-key wush connect --stdio --quiet 127.0.0.1:%p
+`
 	if got != want {
 		t.Fatalf("OpenSSH help:\n%s\nwant:\n%s", got, want)
+	}
+	if !strings.HasSuffix(got, "\n") {
+		t.Fatal("OpenSSH help must leave a blank line after the config block")
 	}
 	if strings.Contains(got, "--auth-key") {
 		t.Fatal("OpenSSH help passes the auth key in argv")
@@ -191,21 +196,25 @@ func TestLicenseReportURL(t *testing.T) {
 	}
 }
 
-func TestDirectConnectionTracker(t *testing.T) {
+func TestPeerConnectionTracker(t *testing.T) {
 	t.Parallel()
 
 	nodeKey := key.NewNode().Public()
 	peerIP := netip.MustParseAddr("fd7a:115c:a1e0::2")
-	tracker := make(directConnectionTracker)
+	tracker := make(peerConnectionTracker)
 	status := &ipnstate.Status{Peer: map[key.NodePublic]*ipnstate.PeerStatus{
 		nodeKey: {
 			TailscaleIPs: []netip.Addr{peerIP},
 			CurAddr:      "192.0.2.1:41641",
 			Relay:        "sea",
+			Active:       true,
 		},
 	}}
 
-	want := []directConnectionEvent{{peer: peerIP.String(), endpoint: "192.0.2.1:41641"}}
+	want := []peerConnectionEvent{{
+		peer: peerIP.String(),
+		path: peerConnectionPath{kind: peerConnectionPathDirect, endpoint: "192.0.2.1:41641"},
+	}}
 	if got := tracker.update(status); !reflect.DeepEqual(got, want) {
 		t.Fatalf("initial direct events = %#v, want %#v", got, want)
 	}
@@ -214,13 +223,31 @@ func TestDirectConnectionTracker(t *testing.T) {
 	}
 
 	status.Peer[nodeKey].CurAddr = ""
-	if got := tracker.update(status); len(got) != 0 {
-		t.Fatalf("relay events = %#v, want none", got)
-	}
-	status.Peer[nodeKey].CurAddr = "198.51.100.2:41641"
-	want = []directConnectionEvent{{peer: peerIP.String(), endpoint: "198.51.100.2:41641"}}
+	want = []peerConnectionEvent{{
+		peer: peerIP.String(),
+		path: peerConnectionPath{kind: peerConnectionPathDERP, endpoint: "sea"},
+	}}
 	if got := tracker.update(status); !reflect.DeepEqual(got, want) {
-		t.Fatalf("reconnected direct events = %#v, want %#v", got, want)
+		t.Fatalf("DERP events = %#v, want %#v", got, want)
+	}
+
+	status.Peer[nodeKey].Relay = ""
+	status.Peer[nodeKey].PeerRelay = "fd7a:115c:a1e0::3:1:2"
+	want = []peerConnectionEvent{{
+		peer: peerIP.String(),
+		path: peerConnectionPath{kind: peerConnectionPathPeerRelay, endpoint: "fd7a:115c:a1e0::3:1:2"},
+	}}
+	if got := tracker.update(status); !reflect.DeepEqual(got, want) {
+		t.Fatalf("peer relay events = %#v, want %#v", got, want)
+	}
+
+	status.Peer[nodeKey].Active = false
+	status.Peer[nodeKey].CurAddr = "203.0.113.3:41641"
+	if got := tracker.update(status); len(got) != 0 {
+		t.Fatalf("inactive peer events = %#v, want none", got)
+	}
+	if len(tracker) != 0 {
+		t.Fatalf("tracker retained %d inactive peers", len(tracker))
 	}
 
 	status.Peer = map[key.NodePublic]*ipnstate.PeerStatus{}
@@ -229,6 +256,36 @@ func TestDirectConnectionTracker(t *testing.T) {
 	}
 	if len(tracker) != 0 {
 		t.Fatalf("tracker retained %d removed peers", len(tracker))
+	}
+}
+
+func TestPeerConnectionLog(t *testing.T) {
+	t.Parallel()
+
+	var output bytes.Buffer
+	humanLog := serveHumanLog{
+		out: &output,
+		now: func() time.Time {
+			return time.Date(2026, time.August, 22, 1, 2, 3, 0, time.UTC)
+		},
+	}
+	dm := &tailcfg.DERPMap{Regions: map[int]*tailcfg.DERPRegion{
+		10: {RegionCode: "sea", RegionName: "Seattle"},
+	}}
+
+	logPeerConnectionPath(humanLog, dm, peerConnectionEvent{
+		peer: "fd7a:115c:a1e0::2",
+		path: peerConnectionPath{kind: peerConnectionPathDirect, endpoint: "192.0.2.1:41641"},
+	})
+	logPeerConnectionPath(humanLog, dm, peerConnectionEvent{
+		peer: "fd7a:115c:a1e0::2",
+		path: peerConnectionPath{kind: peerConnectionPathDERP, endpoint: "sea"},
+	})
+
+	want := "01:02:03 [DIRECT] Peer fd7a:115c:a1e0::2 connected via 192.0.2.1:41641\n" +
+		"01:02:03 [DERP] Peer fd7a:115c:a1e0::2 relayed via Seattle (sea)\n"
+	if got := output.String(); got != want {
+		t.Fatalf("connection log = %q, want %q", got, want)
 	}
 }
 

@@ -195,7 +195,7 @@ func (r *Receive) ListenOverlaySTUN(ctx context.Context) (<-chan struct{}, error
 
 			case <-restun.C:
 				if _, writeErr := conn.WriteToUDP(m.Raw, srvAddr); writeErr != nil {
-					r.HumanLogf("%s Failed to write STUN request on overlay: %s", cliui.Timestamp(time.Now()), writeErr)
+					r.HumanLogf("Failed to write STUN request on overlay: %s", writeErr)
 				}
 				restun.Reset(30 * time.Second)
 			}
@@ -221,7 +221,7 @@ func (r *Receive) ListenOverlaySTUN(ctx context.Context) (<-chan struct{}, error
 					}
 					sealed := r.SelfPriv.SealTo(r.PeerPriv.Public(), raw)
 					if _, writeErr := conn.WriteToUDPAddrPort(sealed, peer.addr); writeErr != nil {
-						r.HumanLogf("%s Failed to send updated node over udp: %s", cliui.Timestamp(time.Now()), writeErr)
+						r.HumanLogf("Failed to send updated node over udp: %s", writeErr)
 					}
 				}
 			}
@@ -405,7 +405,7 @@ func (r *Receive) handleNextMessage(source peerSource, msg []byte, system string
 			res.Node = *lastNode
 		}
 
-		r.HumanLogf("%s Received connection request over %s from %s", cliui.Timestamp(time.Now()), system, cliui.Keyword(fmt.Sprintf("%s@%s", username, hostname)))
+		r.HumanLogf("Received connection request over %s from %s", system, cliui.Keyword(fmt.Sprintf("%s@%s", username, hostname)))
 	case messageTypeNodeUpdate:
 		r.Logger.Debug("received updated node", slog.String("node_key", ovMsg.Node.Key.String()))
 		r.in <- PeerUpdate{ID: ovMsg.SessionID, Node: ovMsg.Node.Clone()}

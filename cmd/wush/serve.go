@@ -53,15 +53,16 @@ func serveCmd() *serpent.Command {
 		Handler: func(inv *serpent.Invocation) error {
 			ctx, ctxCancel := inv.SignalNotifyContext(inv.Context(), os.Interrupt)
 			defer ctxCancel()
+			humanLog := serveHumanLog{out: inv.Stderr, now: time.Now}
+			plainf := func(format string, args ...any) {
+				fmt.Fprintf(inv.Stderr, format+"\n", args...)
+			}
 			var logSink io.Writer = io.Discard
 			if verbose {
 				logSink = inv.Stderr
 			}
 			logger := slog.New(slog.NewTextHandler(logSink, nil))
-			hlog := func(format string, args ...any) {
-				fmt.Fprintf(inv.Stderr, format+"\n", args...)
-			}
-			r := overlay.NewReceiveOverlay(logger, hlog, dm)
+			r := overlay.NewReceiveOverlay(logger, humanLog.info, dm)
 
 			var err error
 			switch overlayType {
@@ -88,15 +89,15 @@ func serveCmd() *serpent.Command {
 
 			// Ensure we always print the auth key on stdout.
 			if term.IsTerminal(int(os.Stdout.Fd())) {
-				hlog("Your auth key is:")
+				plainf("%s", cliui.Bold(pretty.Sprint(cliui.DefaultStyles.Fuchsia, "Your auth key is:")))
 				fmt.Println("  >", cliui.Code(authKey))
-				hlog("Use this key to authenticate other " + cliui.Code("wush") + " commands to this instance.")
+				plainf("Use this key to authenticate other " + cliui.Code("wush") + " commands to this instance.")
 				if portForwardEnabled {
-					hlog("\n%s", serveOpenSSHHelp(authKey, serveUsername()))
+					plainf("\n%s", serveOpenSSHHelp(authKey, serveUsername()))
 				}
 			} else {
 				fmt.Println(cliui.Code(authKey))
-				hlog("The auth key has been printed to stdout")
+				humanLog.info("The auth key has been printed to stdout")
 			}
 
 			s, err := tsserver.NewServer(ctx, logger, r, dm)
@@ -106,8 +107,8 @@ func serveCmd() *serpent.Command {
 			defer s.Close()
 
 			go func() {
-				if err := s.ListenAndServe(ctx); err != nil {
-					logger.Error("local control server stopped", "err", err)
+				if err := s.ListenAndServe(ctx); err != nil && ctx.Err() == nil {
+					humanLog.error("Local control server exited: %s", err)
 				}
 			}()
 			ts, err := newTSNet("receive", verbose, s.ControlURL())
@@ -120,7 +121,6 @@ func serveCmd() *serpent.Command {
 			if err != nil {
 				return fmt.Errorf("bring wireguard up: %w", err)
 			}
-			// hlog("WireGuard is ready")
 
 			closers := []io.Closer{}
 
@@ -137,16 +137,14 @@ func serveCmd() *serpent.Command {
 				}
 				closers = append(closers, sshListener)
 
-				// TODO: replace these logs with all of the options in the beginning.
-				// hlog("SSH server " + pretty.Sprint(cliui.DefaultStyles.Enabled, "enabled"))
 				go func() {
 					err := sshSrv.Serve(sshListener)
 					if err != nil && ctx.Err() == nil {
-						hlog("SSH server exited: " + err.Error())
+						humanLog.error("SSH server exited: %s", err)
 					}
 				}()
 			} else {
-				hlog("SSH server " + pretty.Sprint(cliui.DefaultStyles.Disabled, "disabled"))
+				humanLog.warn("SSH server %s", pretty.Sprint(cliui.DefaultStyles.Disabled, "disabled"))
 			}
 
 			if slices.Contains(enabled, "cp") && !slices.Contains(disabled, "cp") {
@@ -156,15 +154,14 @@ func serveCmd() *serpent.Command {
 				}
 				closers = append([]io.Closer{cpListener}, closers...)
 
-				// hlog("File transfer server " + pretty.Sprint(cliui.DefaultStyles.Enabled, "enabled"))
 				go func() {
-					err := http.Serve(cpListener, http.HandlerFunc(cpHandler))
+					err := http.Serve(cpListener, cpHandler(humanLog.info))
 					if err != nil && ctx.Err() == nil {
-						hlog("File transfer server exited: " + err.Error())
+						humanLog.error("File transfer server exited: %s", err)
 					}
 				}()
 			} else {
-				hlog("File transfer server " + pretty.Sprint(cliui.DefaultStyles.Disabled, "disabled"))
+				humanLog.warn("File transfer server %s", pretty.Sprint(cliui.DefaultStyles.Disabled, "disabled"))
 			}
 
 			if portForwardEnabled {
@@ -172,7 +169,7 @@ func serveCmd() *serpent.Command {
 					return func(src net.Conn) {
 						dst, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", dst.Port()))
 						if err != nil {
-							hlog(pretty.Sprint(cliui.DefaultStyles.Warn, "Failed to dial forwarded connection:", err.Error()))
+							humanLog.error("Failed to dial forwarded connection: %s", err)
 							src.Close()
 							return
 						}
@@ -180,16 +177,15 @@ func serveCmd() *serpent.Command {
 						bicopy(ctx, src, dst)
 					}, true
 				})
-				// hlog("Port-forward server " + pretty.Sprint(cliui.DefaultStyles.Enabled, "enabled"))
 			} else {
-				hlog("Port-forward server " + pretty.Sprint(cliui.DefaultStyles.Disabled, "disabled"))
+				humanLog.warn("Port-forward server %s", pretty.Sprint(cliui.DefaultStyles.Disabled, "disabled"))
 			}
 
 			lc, err := ts.LocalClient()
 			if err != nil {
 				return fmt.Errorf("get local client: %w", err)
 			}
-			go monitorDirectConnections(ctx, lc, hlog)
+			go monitorPeerConnections(ctx, lc, dm, humanLog)
 
 			closers = append(closers, ts)
 			<-ctx.Done()
@@ -233,34 +229,70 @@ func serveCmd() *serpent.Command {
 	}
 }
 
-type directConnectionEvent struct {
-	peer     string
+type serveHumanLog struct {
+	out io.Writer
+	now func() time.Time
+}
+
+func (log serveHumanLog) write(label string, style pretty.Formatter, format string, args ...any) {
+	badge := pretty.Sprint(style, cliui.Bold("["+label+"]"))
+	fmt.Fprintf(log.out, "%s %s %s\n", cliui.Timestamp(log.now()), badge, fmt.Sprintf(format, args...))
+}
+
+func (log serveHumanLog) info(format string, args ...any) {
+	log.write("INFO", cliui.DefaultStyles.Fuchsia, format, args...)
+}
+
+func (log serveHumanLog) warn(format string, args ...any) {
+	log.write("WARN", cliui.DefaultStyles.Warn, format, args...)
+}
+
+func (log serveHumanLog) error(format string, args ...any) {
+	log.write("ERROR", cliui.DefaultStyles.Error, format, args...)
+}
+
+type peerConnectionPathKind uint8
+
+const (
+	peerConnectionPathDirect peerConnectionPathKind = iota + 1
+	peerConnectionPathDERP
+	peerConnectionPathPeerRelay
+)
+
+type peerConnectionPath struct {
+	kind     peerConnectionPathKind
 	endpoint string
 }
 
-type directConnectionTracker map[key.NodePublic]string
+type peerConnectionEvent struct {
+	peer string
+	path peerConnectionPath
+}
 
-func (tracker directConnectionTracker) update(status *ipnstate.Status) []directConnectionEvent {
+type peerConnectionTracker map[key.NodePublic]peerConnectionPath
+
+func (tracker peerConnectionTracker) update(status *ipnstate.Status) []peerConnectionEvent {
 	seen := make(map[key.NodePublic]bool, len(status.Peer))
-	events := make([]directConnectionEvent, 0)
+	events := make([]peerConnectionEvent, 0)
 	for nodeKey, peer := range status.Peer {
 		seen[nodeKey] = true
-		if peer == nil || peer.CurAddr == "" {
+		path, active := currentPeerConnectionPath(peer)
+		if !active {
 			delete(tracker, nodeKey)
 			continue
 		}
-		if tracker[nodeKey] == peer.CurAddr {
+		if tracker[nodeKey] == path {
 			continue
 		}
-		tracker[nodeKey] = peer.CurAddr
+		tracker[nodeKey] = path
 
 		peerLabel := nodeKey.ShortString()
 		if len(peer.TailscaleIPs) > 0 {
 			peerLabel = peer.TailscaleIPs[0].String()
 		}
-		events = append(events, directConnectionEvent{
-			peer:     peerLabel,
-			endpoint: peer.CurAddr,
+		events = append(events, peerConnectionEvent{
+			peer: peerLabel,
+			path: path,
 		})
 	}
 	for nodeKey := range tracker {
@@ -270,17 +302,36 @@ func (tracker directConnectionTracker) update(status *ipnstate.Status) []directC
 	}
 	sort.Slice(events, func(i, j int) bool {
 		if events[i].peer == events[j].peer {
-			return events[i].endpoint < events[j].endpoint
+			if events[i].path.kind == events[j].path.kind {
+				return events[i].path.endpoint < events[j].path.endpoint
+			}
+			return events[i].path.kind < events[j].path.kind
 		}
 		return events[i].peer < events[j].peer
 	})
 	return events
 }
 
-func monitorDirectConnections(ctx context.Context, lc *tailscale.LocalClient, hlog func(string, ...any)) {
+func currentPeerConnectionPath(peer *ipnstate.PeerStatus) (peerConnectionPath, bool) {
+	if peer == nil || !peer.Active {
+		return peerConnectionPath{}, false
+	}
+	if peer.Relay != "" && peer.CurAddr == "" && peer.PeerRelay == "" {
+		return peerConnectionPath{kind: peerConnectionPathDERP, endpoint: peer.Relay}, true
+	}
+	if peer.CurAddr != "" {
+		return peerConnectionPath{kind: peerConnectionPathDirect, endpoint: peer.CurAddr}, true
+	}
+	if peer.PeerRelay != "" {
+		return peerConnectionPath{kind: peerConnectionPathPeerRelay, endpoint: peer.PeerRelay}, true
+	}
+	return peerConnectionPath{}, false
+}
+
+func monitorPeerConnections(ctx context.Context, lc *tailscale.LocalClient, dm *tailcfg.DERPMap, humanLog serveHumanLog) {
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
-	tracker := make(directConnectionTracker)
+	tracker := make(peerConnectionTracker)
 	for {
 		select {
 		case <-ctx.Done():
@@ -291,10 +342,36 @@ func monitorDirectConnections(ctx context.Context, lc *tailscale.LocalClient, hl
 				continue
 			}
 			for _, event := range tracker.update(status) {
-				hlog("Peer %s connected directly via %s", event.peer, event.endpoint)
+				logPeerConnectionPath(humanLog, dm, event)
 			}
 		}
 	}
+}
+
+func logPeerConnectionPath(humanLog serveHumanLog, dm *tailcfg.DERPMap, event peerConnectionEvent) {
+	peer := pretty.Sprint(cliui.DefaultStyles.Keyword, event.peer)
+	switch event.path.kind {
+	case peerConnectionPathDirect:
+		humanLog.write("DIRECT", cliui.DefaultStyles.Enabled, "Peer %s connected via %s", peer,
+			pretty.Sprint(cliui.DefaultStyles.Enabled, event.path.endpoint))
+	case peerConnectionPathDERP:
+		humanLog.write("DERP", cliui.DefaultStyles.Warn, "Peer %s relayed via %s", peer,
+			pretty.Sprint(cliui.DefaultStyles.Warn, derpRegionLabel(dm, event.path.endpoint)))
+	case peerConnectionPathPeerRelay:
+		humanLog.write("PEER RELAY", cliui.DefaultStyles.Fuchsia, "Peer %s relayed via %s", peer,
+			pretty.Sprint(cliui.DefaultStyles.Fuchsia, event.path.endpoint))
+	}
+}
+
+func derpRegionLabel(dm *tailcfg.DERPMap, code string) string {
+	if dm != nil {
+		for _, region := range dm.Regions {
+			if region != nil && strings.EqualFold(region.RegionCode, code) {
+				return fmt.Sprintf("%s (%s)", region.RegionName, region.RegionCode)
+			}
+		}
+	}
+	return code
 }
 
 func serveUsername() string {
@@ -308,14 +385,25 @@ func serveUsername() string {
 }
 
 func serveOpenSSHHelp(authKey, username string) string {
-	return fmt.Sprintf(`Connect with OpenSSH:
-WUSH_AUTH_KEY=%s ssh -o 'ProxyCommand=wush connect --stdio --quiet 127.0.0.1:%%p' %s@wush
+	command := fmt.Sprintf("WUSH_AUTH_KEY=%s ssh -o 'ProxyCommand=wush connect --stdio --quiet 127.0.0.1:%%p' %s@wush", authKey, username)
+	proxyCommand := fmt.Sprintf("env WUSH_AUTH_KEY=%s wush connect --stdio --quiet 127.0.0.1:%%p", authKey)
+	return fmt.Sprintf(`%s
+%s
 
-Or add this block to ~/.ssh/config:
-Host wush
-  HostName wush
-  User %s
-  ProxyCommand env WUSH_AUTH_KEY=%s wush connect --stdio --quiet 127.0.0.1:%%p`, authKey, username, username, authKey)
+%s
+%s
+  %s %s
+  %s %s
+  %s %s
+`,
+		cliui.Bold(pretty.Sprint(cliui.DefaultStyles.Fuchsia, "Connect with OpenSSH:")),
+		cliui.Bold(cliui.Code(command)),
+		cliui.Bold(pretty.Sprint(cliui.DefaultStyles.Fuchsia, "Or add this block to ~/.ssh/config:")),
+		cliui.Bold(pretty.Sprint(cliui.DefaultStyles.Enabled, "Host wush")),
+		pretty.Sprint(cliui.DefaultStyles.Keyword, "HostName"), pretty.Sprint(cliui.DefaultStyles.Fuchsia, "wush"),
+		pretty.Sprint(cliui.DefaultStyles.Keyword, "User"), pretty.Sprint(cliui.DefaultStyles.Fuchsia, username),
+		cliui.Bold(pretty.Sprint(cliui.DefaultStyles.Warn, "ProxyCommand")), pretty.Sprint(cliui.DefaultStyles.Fuchsia, proxyCommand),
+	)
 }
 
 func newTSNet(direction string, verbose bool, controlURL string) (*tsnet.Server, error) {
@@ -382,40 +470,42 @@ func bicopy(ctx context.Context, c1, c2 io.ReadWriteCloser) {
 	}
 }
 
-func cpHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "POST" {
+func cpHandler(hlog func(string, ...any)) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "POST" {
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte("OK"))
+			return
+		}
+
+		fiName, err := uploadFileName(r.URL.Path)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		defer r.Body.Close()
+
+		fi, err := os.OpenFile(fiName, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0644)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		defer fi.Close()
+
+		bar := progressbar.DefaultBytes(
+			r.ContentLength,
+			fmt.Sprintf("Downloading %q", fiName),
+		)
+		defer bar.Close()
+		_, err = io.Copy(io.MultiWriter(fi, bar), r.Body)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("OK"))
-		return
-	}
-
-	fiName, err := uploadFileName(r.URL.Path)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-	defer r.Body.Close()
-
-	fi, err := os.OpenFile(fiName, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0644)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	defer fi.Close()
-
-	bar := progressbar.DefaultBytes(
-		r.ContentLength,
-		fmt.Sprintf("Downloading %q", fiName),
-	)
-	defer bar.Close()
-	_, err = io.Copy(io.MultiWriter(fi, bar), r.Body)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	w.WriteHeader(http.StatusOK)
-	w.Write([]byte(fmt.Sprintf("File %q written", fiName)))
-	fmt.Printf("Received file %s from %s\n", fiName, r.RemoteAddr)
+		w.Write([]byte(fmt.Sprintf("File %q written", fiName)))
+		hlog("Received file %s from %s", cliui.Code(fiName), cliui.Keyword(r.RemoteAddr))
+	})
 }
 
 func uploadFileName(requestPath string) (string, error) {

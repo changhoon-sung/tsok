@@ -175,6 +175,18 @@ Host wush
 	}
 }
 
+func TestLicenseReportURL(t *testing.T) {
+	t.Parallel()
+
+	const commitHash = "0123456789abcdef0123456789abcdef01234567"
+	if got, want := licenseReportURL(commitHash), "https://github.com/changhoon-sung/wush/blob/"+commitHash+"/licenses/wush.md"; got != want {
+		t.Fatalf("license report URL = %q, want %q", got, want)
+	}
+	if got, want := licenseReportURL(strings.Repeat("0", 40)), "https://github.com/changhoon-sung/wush/blob/main/licenses/wush.md"; got != want {
+		t.Fatalf("development license report URL = %q, want %q", got, want)
+	}
+}
+
 func TestParsePortRangeIncludesMaximumPort(t *testing.T) {
 	t.Parallel()
 

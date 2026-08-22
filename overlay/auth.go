@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net/netip"
 
 	"github.com/btcsuite/btcd/btcutil/base58"
 	"github.com/coder/wush/cliui"
@@ -23,11 +22,8 @@ type ClientAuth struct {
 	// ReceiverPublicKey is the public key of the receiver. Node messages are
 	// encrypted to this public key.
 	ReceiverPublicKey key.NodePublic
-	// ReceiverStunAddr is the address that the receiver is reachable over UDP
-	// when the overlay is running in P2P mode.
-	ReceiverStunAddr netip.AddrPort
 	// ReceiverDERPRegionID is the region id that the receiver is reachable over
-	// DERP when the overlay is running in DERP mode.
+	// DERP.
 	ReceiverDERPRegionID uint16
 }
 
@@ -40,11 +36,6 @@ const (
 
 func (ca *ClientAuth) PrintDebug(logf func(str string, args ...any), dm *tailcfg.DERPMap) {
 	logf("Auth information:")
-	stunStr := ca.ReceiverStunAddr.String()
-	if !ca.ReceiverStunAddr.IsValid() {
-		stunStr = "Disabled"
-	}
-	logf("\t> Server overlay STUN address: %s", cliui.Code(stunStr))
 	derpStr := "Disabled"
 	if ca.ReceiverDERPRegionID > 0 {
 		region := dm.Regions[int(ca.ReceiverDERPRegionID)]
@@ -67,14 +58,9 @@ func (ca *ClientAuth) AuthKey() string {
 	// peers used value 1 and are no longer supported.
 	buf.WriteByte(authKeyPeerTypeCLI)
 
-	buf.WriteByte(byte(ca.ReceiverStunAddr.Addr().BitLen() / 8))
-	if ca.ReceiverStunAddr.Addr().BitLen() > 0 {
-		stunBytes, err := ca.ReceiverStunAddr.MarshalBinary()
-		if err != nil {
-			panic(fmt.Sprint("failed to marshal stun addr:", err))
-		}
-		buf.Write(stunBytes)
-	}
+	// Keep the legacy STUN address-length byte in the wire format so DERP-based
+	// v1 and v2 auth keys remain compatible. New keys always encode no address.
+	buf.WriteByte(0)
 
 	derpBuf := [2]byte{}
 	binary.BigEndian.PutUint16(derpBuf[:], ca.ReceiverDERPRegionID)
@@ -130,16 +116,7 @@ func (ca *ClientAuth) Parse(authKey string) error {
 
 	ipLen := int(ipLenB)
 	if ipLen > 0 {
-		stunIPBytes := make([]byte, ipLen+2)
-		n, err := decr.Read(stunIPBytes)
-		if n != len(stunIPBytes) || err != nil {
-			return errors.New("read STUN ip; invalid authkey")
-		}
-
-		err = parsed.ReceiverStunAddr.UnmarshalBinary(stunIPBytes)
-		if err != nil {
-			return fmt.Errorf("unmarshal receiver stun address: %w", err)
-		}
+		return errors.New("STUN overlay auth keys are not supported")
 	}
 
 	derpRegionBytes := make([]byte, 2)
@@ -148,6 +125,9 @@ func (ca *ClientAuth) Parse(authKey string) error {
 		return errors.New("read derp region; invalid authkey")
 	}
 	parsed.ReceiverDERPRegionID = binary.BigEndian.Uint16(derpRegionBytes)
+	if parsed.ReceiverDERPRegionID == 0 {
+		return errors.New("auth key does not specify a DERP region")
+	}
 
 	pubKeyBytes := make([]byte, 32)
 	n, err = io.ReadFull(decr, pubKeyBytes)

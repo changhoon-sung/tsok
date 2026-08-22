@@ -36,11 +36,10 @@ import (
 
 func serveCmd() *serpent.Command {
 	var (
-		overlayType string
-		verbose     bool
-		enabled     = []string{}
-		disabled    = []string{}
-		derpmapFi   string
+		verbose   bool
+		enabled   = []string{}
+		disabled  = []string{}
+		derpmapFi string
 
 		dm = new(tailcfg.DERPMap)
 	)
@@ -64,25 +63,10 @@ func serveCmd() *serpent.Command {
 			logger := slog.New(slog.NewTextHandler(logSink, nil))
 			r := overlay.NewReceiveOverlay(logger, humanLog.info, dm)
 
-			var err error
-			switch overlayType {
-			case "derp":
-				err = r.PickDERPHome(ctx)
-				if err != nil {
-					return err
-				}
-				go r.ListenOverlayDERP(ctx)
-
-			case "stun":
-				waitStun, err := r.ListenOverlaySTUN(ctx)
-				if err != nil {
-					return fmt.Errorf("get stun addr: %w", err)
-				}
-				<-waitStun
-
-			default:
-				return fmt.Errorf("unknown overlay type: %s", overlayType)
+			if err := r.PickDERPHome(ctx); err != nil {
+				return err
 			}
+			go r.ListenOverlayDERP(ctx)
 
 			authKey := r.ClientAuth().AuthKey()
 			portForwardEnabled := slices.Contains(enabled, "port-forward") && !slices.Contains(disabled, "port-forward")
@@ -195,11 +179,6 @@ func serveCmd() *serpent.Command {
 			return nil
 		},
 		Options: []serpent.Option{
-			{
-				Flag:    "overlay-type",
-				Default: "derp",
-				Value:   serpent.EnumOf(&overlayType, "derp", "stun"),
-			},
 			{
 				Flag:          "verbose",
 				FlagShorthand: "v",

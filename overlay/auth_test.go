@@ -2,7 +2,6 @@ package overlay
 
 import (
 	"fmt"
-	"net/netip"
 	"reflect"
 	"strings"
 	"testing"
@@ -15,37 +14,25 @@ import (
 func TestClientAuthRoundTrip(t *testing.T) {
 	t.Parallel()
 
-	for _, stunAddr := range []netip.AddrPort{
-		{},
-		netip.MustParseAddrPort("192.0.2.1:12345"),
-		netip.MustParseAddrPort("[2001:db8::1]:54321"),
-	} {
-		stunAddr := stunAddr
-		t.Run(stunAddr.String(), func(t *testing.T) {
-			t.Parallel()
+	receiverPrivate := key.NewNode()
+	original := ClientAuth{
+		OverlayPrivateKey:    key.NewNode(),
+		ReceiverPublicKey:    receiverPrivate.Public(),
+		ReceiverDERPRegionID: 21,
+	}
 
-			receiverPrivate := key.NewNode()
-			original := ClientAuth{
-				OverlayPrivateKey:    key.NewNode(),
-				ReceiverPublicKey:    receiverPrivate.Public(),
-				ReceiverStunAddr:     stunAddr,
-				ReceiverDERPRegionID: 21,
-			}
+	encoded := original.AuthKey()
+	raw := base58.Decode(encoded)
+	if len(raw) < 3 || raw[0] != authKeyVersion || raw[1] != authKeyPeerTypeCLI || raw[2] != 0 {
+		t.Fatalf("auth key header = %v, want version %d, CLI type %d, and no legacy STUN address", raw[:min(len(raw), 3)], authKeyVersion, authKeyPeerTypeCLI)
+	}
 
-			encoded := original.AuthKey()
-			raw := base58.Decode(encoded)
-			if len(raw) < 2 || raw[0] != authKeyVersion || raw[1] != authKeyPeerTypeCLI {
-				t.Fatalf("auth key header = %v, want version %d and CLI type %d", raw[:min(len(raw), 2)], authKeyVersion, authKeyPeerTypeCLI)
-			}
-
-			var parsed ClientAuth
-			if err := parsed.Parse(encoded); err != nil {
-				t.Fatalf("parse auth key: %v", err)
-			}
-			if !reflect.DeepEqual(parsed, original) {
-				t.Fatalf("parsed auth = %#v, want %#v", parsed, original)
-			}
-		})
+	var parsed ClientAuth
+	if err := parsed.Parse(encoded); err != nil {
+		t.Fatalf("parse auth key: %v", err)
+	}
+	if !reflect.DeepEqual(parsed, original) {
+		t.Fatalf("parsed auth = %#v, want %#v", parsed, original)
 	}
 }
 
@@ -118,6 +105,22 @@ func TestClientAuthRejectsUnsupportedTypesAndTrailingData(t *testing.T) {
 			want: "unsupported authkey peer type",
 		},
 		{
+			name: "STUN overlay key",
+			edit: func(raw []byte) []byte {
+				withSTUN := append([]byte{raw[0], raw[1], 4}, make([]byte, 6)...)
+				return append(withSTUN, raw[3:]...)
+			},
+			want: "STUN overlay auth keys are not supported",
+		},
+		{
+			name: "missing DERP region",
+			edit: func(raw []byte) []byte {
+				clear(raw[3:5])
+				return raw
+			},
+			want: "does not specify a DERP region",
+		},
+		{
 			name: "zero receiver key",
 			edit: func(raw []byte) []byte {
 				clear(raw[5:37])
@@ -164,7 +167,6 @@ func TestClientAuthRejectsEveryTruncation(t *testing.T) {
 	auth := ClientAuth{
 		OverlayPrivateKey:    key.NewNode(),
 		ReceiverPublicKey:    key.NewNode().Public(),
-		ReceiverStunAddr:     netip.MustParseAddrPort("192.0.2.1:12345"),
 		ReceiverDERPRegionID: 1,
 	}
 	raw := base58.Decode(auth.AuthKey())

@@ -412,14 +412,13 @@ func TestBuildRsyncArgsPreservesBoundariesAndForwardsOptions(t *testing.T) {
 	t.Parallel()
 
 	opts := &sendOverlayOpts{
-		stunAddrOverride: "192.0.2.10",
-		waitP2P:          true,
+		waitP2P: true,
 	}
 	forwarded := []string{"local file.txt", ":/remote path", "; touch /tmp/not-run"}
 	got := buildRsyncArgs("/Applications/wush's bin/wush", forwarded, opts, true)
 	want := []string{
 		"-e",
-		`'/Applications/wush'"'"'s bin/wush' 'ssh' '--quiet' '--stun-ip-override' '192.0.2.10' '--wait-p2p' '--verbose' '--'`,
+		`'/Applications/wush'"'"'s bin/wush' 'ssh' '--quiet' '--wait-p2p' '--verbose' '--'`,
 		"local file.txt",
 		":/remote path",
 		"; touch /tmp/not-run",

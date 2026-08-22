@@ -72,6 +72,10 @@ WireGuard path, `wush serve` reports the peer IP and its UDP endpoint. If a
 direct path is unavailable, it reports the relay region name and code, for
 example `Toronto (tor)`.
 
+`wush` always uses DERP for authenticated peer bootstrap. This does not force
+application data through the relay: tsnet still uses the DERP map's STUN
+endpoints to probe direct UDP paths and falls back to DERP only when needed.
+
 [![asciicast](https://asciinema.org/a/ZrCNiRRkeHUi5Lj3fqC3ovLqi.svg)](https://asciinema.org/a/ZrCNiRRkeHUi5Lj3fqC3ovLqi)
 
 > [!NOTE]  

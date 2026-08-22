@@ -2,9 +2,7 @@ package overlay
 
 import (
 	"encoding/json"
-	"fmt"
 	"log/slog"
-	"net/netip"
 	"strings"
 	"testing"
 	"time"
@@ -97,7 +95,7 @@ func TestReceiveRejectsMalformedOverlayMessage(t *testing.T) {
 		PeerPriv: key.NewNode(),
 	}
 	sealed := receive.PeerPriv.SealTo(receive.SelfPriv.Public(), []byte("{"))
-	if _, err := receive.handleNextMessage(testPeerSource(10001), sealed, "test"); err == nil {
+	if _, err := receive.handleNextMessage(testPeerSource(), sealed, "test"); err == nil {
 		t.Fatal("handleNextMessage() succeeded for malformed JSON")
 	}
 }
@@ -108,7 +106,7 @@ func TestReceiveTracksMultipleActivePeersAndGoodbye(t *testing.T) {
 	receive := newTestReceive()
 	for i, sessionID := range []string{"session-a", "session-b"} {
 		hello := sealReceiveMessage(t, receive, overlayMessage{Typ: messageTypeHello, SessionID: sessionID})
-		if _, err := receive.handleNextMessage(testPeerSource(10001+i), hello, "test"); err != nil {
+		if _, err := receive.handleNextMessage(testPeerSource(), hello, "test"); err != nil {
 			t.Fatalf("accept %s: %v", sessionID, err)
 		}
 		node := tailcfg.Node{ID: tailcfg.NodeID(i + 1), Key: key.NewNode().Public()}
@@ -117,7 +115,7 @@ func TestReceiveTracksMultipleActivePeersAndGoodbye(t *testing.T) {
 			SessionID: sessionID,
 			Node:      node,
 		})
-		if _, err := receive.handleNextMessage(testPeerSource(10001+i), update, "test"); err != nil {
+		if _, err := receive.handleNextMessage(testPeerSource(), update, "test"); err != nil {
 			t.Fatalf("update from %s: %v", sessionID, err)
 		}
 	}
@@ -132,7 +130,7 @@ func TestReceiveTracksMultipleActivePeersAndGoodbye(t *testing.T) {
 		Typ:       messageTypeGoodbye,
 		SessionID: "session-a",
 	})
-	if _, err := receive.handleNextMessage(testPeerSource(10001), goodbye, "test"); err != nil {
+	if _, err := receive.handleNextMessage(testPeerSource(), goodbye, "test"); err != nil {
 		t.Fatalf("goodbye: %v", err)
 	}
 	if got := len(receive.peers); got != 1 {
@@ -156,7 +154,7 @@ func TestReceiveRequiresHelloBeforeNodeUpdate(t *testing.T) {
 		SessionID: "session-a",
 		Node:      tailcfg.Node{ID: 1, Key: key.NewNode().Public()},
 	})
-	if _, err := receive.handleNextMessage(testPeerSource(10001), update, "test"); err == nil || !strings.Contains(err.Error(), "must be hello") {
+	if _, err := receive.handleNextMessage(testPeerSource(), update, "test"); err == nil || !strings.Contains(err.Error(), "must be hello") {
 		t.Fatalf("first update error = %v, want hello requirement", err)
 	}
 	if len(receive.in) != 0 {
@@ -164,27 +162,29 @@ func TestReceiveRequiresHelloBeforeNodeUpdate(t *testing.T) {
 	}
 }
 
-func TestReceiveTracksSessionAcrossAddressChange(t *testing.T) {
+func TestReceiveTracksSessionAcrossDERPKeyChange(t *testing.T) {
 	t.Parallel()
 
 	receive := newTestReceive()
+	firstSource := testPeerSource()
 	hello := sealReceiveMessage(t, receive, overlayMessage{
 		Typ:       messageTypeHello,
 		SessionID: "session-a",
 	})
-	if _, err := receive.handleNextMessage(testPeerSource(10001), hello, "test"); err != nil {
+	if _, err := receive.handleNextMessage(firstSource, hello, "test"); err != nil {
 		t.Fatal(err)
 	}
+	secondSource := testPeerSource()
 	ping := sealReceiveMessage(t, receive, overlayMessage{
 		Typ:       messageTypePing,
 		SessionID: "session-a",
 	})
-	if _, err := receive.handleNextMessage(testPeerSource(10002), ping, "test"); err != nil {
+	if _, err := receive.handleNextMessage(secondSource, ping, "test"); err != nil {
 		t.Fatal(err)
 	}
-	peers := receive.stunPeers()
-	if len(peers) != 1 || peers[0].addr.Port() != 10002 {
-		t.Fatalf("STUN peers = %#v, want session on updated port 10002", peers)
+	peers := receive.derpPeers()
+	if len(peers) != 1 || peers[0].key != secondSource.derpKey {
+		t.Fatalf("DERP peers = %#v, want session on updated DERP key", peers)
 	}
 }
 
@@ -220,10 +220,9 @@ func newTestReceive() *Receive {
 	}
 }
 
-func testPeerSource(port int) peerSource {
+func testPeerSource() peerSource {
 	return peerSource{
-		transport: peerTransportSTUN,
-		stunAddr:  netip.MustParseAddrPort("127.0.0.1:" + fmt.Sprint(port)),
+		derpKey: key.NewNode().Public(),
 	}
 }
 

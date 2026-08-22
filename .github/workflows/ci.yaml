@@ -26,13 +26,20 @@ jobs:
         run: |
           scripts/generate-licenses.sh
           git diff --exit-code -- licenses/wush.md
+      - name: Check release configuration
+        uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
+        with:
+          distribution: goreleaser
+          version: v2.17.1
+          args: check
       - name: Test with race detector
         run: go test -race ./...
       - name: Vet
         run: go vet ./...
-      - name: Build CLI
-        run: go build -trimpath ./cmd/wush
-      - name: Cross-build representative targets
+      - name: Build Linux/amd64 release target
+        run: CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o /tmp/wush-linux-amd64 ./cmd/wush
+      - name: Cross-build remaining release targets
         run: |
           CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -o /tmp/wush-linux-arm64 ./cmd/wush
-          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -o /tmp/wush-windows-amd64.exe ./cmd/wush
+          CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 go build -trimpath -o /tmp/wush-darwin-amd64 ./cmd/wush
+          CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -trimpath -o /tmp/wush-darwin-arm64 ./cmd/wush

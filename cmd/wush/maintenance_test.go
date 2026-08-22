@@ -499,23 +499,3 @@ func TestReadUploadResponse(t *testing.T) {
 		})
 	}
 }
-
-func TestBuildRsyncArgsPreservesBoundariesAndForwardsOptions(t *testing.T) {
-	t.Parallel()
-
-	opts := &sendOverlayOpts{
-		waitP2P: true,
-	}
-	forwarded := []string{"local file.txt", ":/remote path", "; touch /tmp/not-run"}
-	got := buildRsyncArgs("/Applications/wush's bin/wush", forwarded, opts, true)
-	want := []string{
-		"-e",
-		`'/Applications/wush'"'"'s bin/wush' 'ssh' '--quiet' '--wait-p2p' '--verbose' '--'`,
-		"local file.txt",
-		":/remote path",
-		"; touch /tmp/not-run",
-	}
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("buildRsyncArgs() = %#v, want %#v", got, want)
-	}
-}

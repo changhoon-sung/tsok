@@ -30,10 +30,6 @@ func main() {
 				Command:     "wush ssh",
 			},
 			example{
-				Description: "Transfer files to a wush server with rsync",
-				Command:     "wush rsync local-file.txt :/path/to/remote/file",
-			},
-			example{
 				Description: "Copy a single file to a wush server",
 				Command:     "wush cp local-file.txt",
 			},
@@ -50,7 +46,6 @@ func main() {
 			sshCmd(),
 			connectCmd(),
 			serveCmd(),
-			rsyncCmd(),
 			cpCmd(),
 			portForwardCmd(),
 		},

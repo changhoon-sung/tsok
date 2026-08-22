@@ -216,6 +216,33 @@ func TestServerAllowsOneSessionPerConnection(t *testing.T) {
 	}
 }
 
+func TestServerCloseTerminatesActiveSession(t *testing.T) {
+	t.Parallel()
+
+	server, listener := startTestServer(t)
+	client := dialTestServer(t, listener.Addr().String())
+	defer client.Close()
+
+	session, err := client.NewSession()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := session.Start("sleep 30"); err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- session.Wait() }()
+	if err := server.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("active SSH session did not exit after server close")
+	}
+}
+
 func TestSignalExitCode(t *testing.T) {
 	t.Parallel()
 

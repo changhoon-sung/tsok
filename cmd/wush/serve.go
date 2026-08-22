@@ -51,7 +51,8 @@ func serveCmd() *serpent.Command {
 			derpMap(&derpmapFi, dm),
 		),
 		Handler: func(inv *serpent.Invocation) error {
-			ctx := inv.Context()
+			ctx, ctxCancel := inv.SignalNotifyContext(inv.Context(), os.Interrupt)
+			defer ctxCancel()
 			var logSink io.Writer = io.Discard
 			if verbose {
 				logSink = inv.Stderr
@@ -140,7 +141,7 @@ func serveCmd() *serpent.Command {
 				// hlog("SSH server " + pretty.Sprint(cliui.DefaultStyles.Enabled, "enabled"))
 				go func() {
 					err := sshSrv.Serve(sshListener)
-					if err != nil {
+					if err != nil && ctx.Err() == nil {
 						hlog("SSH server exited: " + err.Error())
 					}
 				}()
@@ -158,7 +159,7 @@ func serveCmd() *serpent.Command {
 				// hlog("File transfer server " + pretty.Sprint(cliui.DefaultStyles.Enabled, "enabled"))
 				go func() {
 					err := http.Serve(cpListener, http.HandlerFunc(cpHandler))
-					if err != nil {
+					if err != nil && ctx.Err() == nil {
 						hlog("File transfer server exited: " + err.Error())
 					}
 				}()
@@ -184,8 +185,6 @@ func serveCmd() *serpent.Command {
 				hlog("Port-forward server " + pretty.Sprint(cliui.DefaultStyles.Disabled, "disabled"))
 			}
 
-			ctx, ctxCancel := inv.SignalNotifyContext(ctx, os.Interrupt)
-			defer ctxCancel()
 			lc, err := ts.LocalClient()
 			if err != nil {
 				return fmt.Errorf("get local client: %w", err)

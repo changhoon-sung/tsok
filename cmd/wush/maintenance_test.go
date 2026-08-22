@@ -13,6 +13,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/types/key"
@@ -228,6 +229,29 @@ func TestDirectConnectionTracker(t *testing.T) {
 	}
 	if len(tracker) != 0 {
 		t.Fatalf("tracker retained %d removed peers", len(tracker))
+	}
+}
+
+func TestBicopyCancellationClosesConnections(t *testing.T) {
+	t.Parallel()
+
+	left, leftPeer := net.Pipe()
+	right, rightPeer := net.Pipe()
+	defer leftPeer.Close()
+	defer rightPeer.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		bicopy(ctx, left, right)
+		close(done)
+	}()
+	cancel()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("bicopy did not exit after cancellation")
 	}
 }
 

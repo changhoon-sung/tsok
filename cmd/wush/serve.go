@@ -89,9 +89,9 @@ func serveCmd() *serpent.Command {
 
 			// Ensure we always print the auth key on stdout.
 			if term.IsTerminal(int(os.Stdout.Fd())) {
-				plainf("%s", cliui.Bold(pretty.Sprint(cliui.DefaultStyles.Fuchsia, "Your auth key is:")))
-				fmt.Println("  >", cliui.Code(authKey))
-				plainf("Use this key to authenticate other " + cliui.Code("wush") + " commands to this instance.")
+				plainf("%s", cliui.Bold("Your auth key is:"))
+				fmt.Println("  >", authKey)
+				plainf("Use this key to authenticate other wush commands to this instance.")
 				if portForwardEnabled {
 					plainf("\n%s", serveOpenSSHHelp(authKey, serveUsername()))
 				}
@@ -240,7 +240,7 @@ func (log serveHumanLog) write(label string, style pretty.Formatter, format stri
 }
 
 func (log serveHumanLog) info(format string, args ...any) {
-	log.write("INFO", cliui.DefaultStyles.Fuchsia, format, args...)
+	log.write("INFO", pretty.Style{}, format, args...)
 }
 
 func (log serveHumanLog) warn(format string, args ...any) {
@@ -349,17 +349,14 @@ func monitorPeerConnections(ctx context.Context, lc *tailscale.LocalClient, dm *
 }
 
 func logPeerConnectionPath(humanLog serveHumanLog, dm *tailcfg.DERPMap, event peerConnectionEvent) {
-	peer := pretty.Sprint(cliui.DefaultStyles.Keyword, event.peer)
 	switch event.path.kind {
 	case peerConnectionPathDirect:
-		humanLog.write("DIRECT", cliui.DefaultStyles.Enabled, "Peer %s connected via %s", peer,
-			pretty.Sprint(cliui.DefaultStyles.Enabled, event.path.endpoint))
+		humanLog.write("DIRECT", cliui.DefaultStyles.Enabled, "Peer %s connected via %s", event.peer, event.path.endpoint)
 	case peerConnectionPathDERP:
-		humanLog.write("DERP", cliui.DefaultStyles.Warn, "Peer %s relayed via %s", peer,
-			pretty.Sprint(cliui.DefaultStyles.Warn, derpRegionLabel(dm, event.path.endpoint)))
+		humanLog.write("DERP", cliui.DefaultStyles.Warn, "Peer %s relayed via %s", event.peer,
+			derpRegionLabel(dm, event.path.endpoint))
 	case peerConnectionPathPeerRelay:
-		humanLog.write("PEER RELAY", cliui.DefaultStyles.Fuchsia, "Peer %s relayed via %s", peer,
-			pretty.Sprint(cliui.DefaultStyles.Fuchsia, event.path.endpoint))
+		humanLog.write("PEER RELAY", cliui.DefaultStyles.Fuchsia, "Peer %s relayed via %s", event.peer, event.path.endpoint)
 	}
 }
 
@@ -385,24 +382,25 @@ func serveUsername() string {
 }
 
 func serveOpenSSHHelp(authKey, username string) string {
-	command := fmt.Sprintf("WUSH_AUTH_KEY=%s ssh -o 'ProxyCommand=wush connect --stdio --quiet 127.0.0.1:%%p' %s@wush", authKey, username)
-	proxyCommand := fmt.Sprintf("env WUSH_AUTH_KEY=%s wush connect --stdio --quiet 127.0.0.1:%%p", authKey)
+	authAssignment := pretty.Sprint(cliui.DefaultStyles.Fuchsia, "WUSH_AUTH_KEY") + "=" + authKey
+	proxyOption := "'" + pretty.Sprint(cliui.DefaultStyles.Warn, "ProxyCommand") + "=wush connect --stdio --quiet 127.0.0.1:%p'"
+	command := fmt.Sprintf("%s ssh -o %s %s@wush", authAssignment, proxyOption, username)
+	proxyCommand := fmt.Sprintf("env %s wush connect --stdio --quiet 127.0.0.1:%%p", authAssignment)
 	return fmt.Sprintf(`%s
 %s
 
 %s
 %s
-  %s %s
-  %s %s
+  HostName wush
+  User %s
   %s %s
 `,
-		cliui.Bold(pretty.Sprint(cliui.DefaultStyles.Fuchsia, "Connect with OpenSSH:")),
-		cliui.Bold(cliui.Code(command)),
-		cliui.Bold(pretty.Sprint(cliui.DefaultStyles.Fuchsia, "Or add this block to ~/.ssh/config:")),
-		cliui.Bold(pretty.Sprint(cliui.DefaultStyles.Enabled, "Host wush")),
-		pretty.Sprint(cliui.DefaultStyles.Keyword, "HostName"), pretty.Sprint(cliui.DefaultStyles.Fuchsia, "wush"),
-		pretty.Sprint(cliui.DefaultStyles.Keyword, "User"), pretty.Sprint(cliui.DefaultStyles.Fuchsia, username),
-		cliui.Bold(pretty.Sprint(cliui.DefaultStyles.Warn, "ProxyCommand")), pretty.Sprint(cliui.DefaultStyles.Fuchsia, proxyCommand),
+		cliui.Bold("Connect with OpenSSH:"),
+		command,
+		cliui.Bold("Or add this block to ~/.ssh/config:"),
+		cliui.Bold("Host wush"),
+		username,
+		pretty.Sprint(cliui.DefaultStyles.Warn, "ProxyCommand"), proxyCommand,
 	)
 }
 
@@ -504,7 +502,7 @@ func cpHandler(hlog func(string, ...any)) http.Handler {
 		}
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte(fmt.Sprintf("File %q written", fiName)))
-		hlog("Received file %s from %s", cliui.Code(fiName), cliui.Keyword(r.RemoteAddr))
+		hlog("Received file %s from %s", fiName, r.RemoteAddr)
 	})
 }
 

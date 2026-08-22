@@ -282,8 +282,8 @@ func TestPeerConnectionLog(t *testing.T) {
 		path: peerConnectionPath{kind: peerConnectionPathDERP, endpoint: "sea"},
 	})
 
-	want := "01:02:03 [DIRECT] Peer fd7a:115c:a1e0::2 connected via 192.0.2.1:41641\n" +
-		"01:02:03 [DERP] Peer fd7a:115c:a1e0::2 relayed via Seattle (sea)\n"
+	want := "01:02:03 Peer fd7a:115c:a1e0::2 connected directly via 192.0.2.1:41641\n" +
+		"01:02:03 Peer fd7a:115c:a1e0::2 relayed via Seattle (sea)\n"
 	if got := output.String(); got != want {
 		t.Fatalf("connection log = %q, want %q", got, want)
 	}

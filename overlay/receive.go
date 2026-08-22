@@ -135,10 +135,10 @@ func (r *Receive) PickDERPHome(ctx context.Context) error {
 	}
 
 	if report.PreferredDERP == 0 {
-		r.HumanLogf("Failed to determine overlay DERP region, defaulting to NYC.")
+		r.HumanLogf("Failed to determine overlay DERP region, defaulting to %s.", cliui.Code("NYC"))
 		r.derpRegionID = 1
 	} else {
-		r.HumanLogf("Picked DERP region %s as overlay home", r.DerpMap.Regions[report.PreferredDERP].RegionName)
+		r.HumanLogf("Picked DERP region %s as overlay home", cliui.Code(r.DerpMap.Regions[report.PreferredDERP].RegionName))
 		r.derpRegionID = uint16(report.PreferredDERP)
 	}
 
@@ -405,7 +405,7 @@ func (r *Receive) handleNextMessage(source peerSource, msg []byte, system string
 			res.Node = *lastNode
 		}
 
-		r.HumanLogf("Received connection request over %s from %s", system, fmt.Sprintf("%s@%s", username, hostname))
+		r.HumanLogf("Received connection request over %s from %s", system, cliui.Keyword(fmt.Sprintf("%s@%s", username, hostname)))
 	case messageTypeNodeUpdate:
 		r.Logger.Debug("received updated node", slog.String("node_key", ovMsg.Node.Key.String()))
 		r.in <- PeerUpdate{ID: ovMsg.SessionID, Node: ovMsg.Node.Clone()}

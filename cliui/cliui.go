@@ -139,9 +139,6 @@ func init() {
 			pretty.FgColor(color.Color("#FFFFFF")),
 			pretty.BgColor(color.Color("#2b2a2a")),
 		},
-		Fuchsia: pretty.Style{
-			pretty.FgColor(Fuchsia),
-		},
 		Keyword: pretty.Style{
 			pretty.FgColor(Green),
 		},

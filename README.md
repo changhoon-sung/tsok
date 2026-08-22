@@ -80,7 +80,7 @@ Building from source requires Go 1.27 or newer. From the repository root:
 
 ```bash
 mkdir -p dist
-CGO_ENABLED=0 go build -trimpath -o dist/wush ./cmd/wush
+go build -trimpath -o dist/wush ./cmd/wush
 ./dist/wush --help
 ```
 

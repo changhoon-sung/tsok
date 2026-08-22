@@ -13,6 +13,9 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+
+	"tailscale.com/ipn/ipnstate"
+	"tailscale.com/types/key"
 )
 
 func TestConnectTargetPort(t *testing.T) {
@@ -184,6 +187,47 @@ func TestLicenseReportURL(t *testing.T) {
 	}
 	if got, want := licenseReportURL(strings.Repeat("0", 40)), "https://github.com/changhoon-sung/wush/blob/main/licenses/wush.md"; got != want {
 		t.Fatalf("development license report URL = %q, want %q", got, want)
+	}
+}
+
+func TestDirectConnectionTracker(t *testing.T) {
+	t.Parallel()
+
+	nodeKey := key.NewNode().Public()
+	peerIP := netip.MustParseAddr("fd7a:115c:a1e0::2")
+	tracker := make(directConnectionTracker)
+	status := &ipnstate.Status{Peer: map[key.NodePublic]*ipnstate.PeerStatus{
+		nodeKey: {
+			TailscaleIPs: []netip.Addr{peerIP},
+			CurAddr:      "192.0.2.1:41641",
+			Relay:        "sea",
+		},
+	}}
+
+	want := []directConnectionEvent{{peer: peerIP.String(), endpoint: "192.0.2.1:41641"}}
+	if got := tracker.update(status); !reflect.DeepEqual(got, want) {
+		t.Fatalf("initial direct events = %#v, want %#v", got, want)
+	}
+	if got := tracker.update(status); len(got) != 0 {
+		t.Fatalf("unchanged direct events = %#v, want none", got)
+	}
+
+	status.Peer[nodeKey].CurAddr = ""
+	if got := tracker.update(status); len(got) != 0 {
+		t.Fatalf("relay events = %#v, want none", got)
+	}
+	status.Peer[nodeKey].CurAddr = "198.51.100.2:41641"
+	want = []directConnectionEvent{{peer: peerIP.String(), endpoint: "198.51.100.2:41641"}}
+	if got := tracker.update(status); !reflect.DeepEqual(got, want) {
+		t.Fatalf("reconnected direct events = %#v, want %#v", got, want)
+	}
+
+	status.Peer = map[key.NodePublic]*ipnstate.PeerStatus{}
+	if got := tracker.update(status); len(got) != 0 {
+		t.Fatalf("removed peer events = %#v, want none", got)
+	}
+	if len(tracker) != 0 {
+		t.Fatalf("tracker retained %d removed peers", len(tracker))
 	}
 }
 

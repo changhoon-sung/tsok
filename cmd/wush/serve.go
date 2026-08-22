@@ -12,14 +12,19 @@ import (
 	"path"
 	"path/filepath"
 	"slices"
+	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/schollz/progressbar/v3"
 	"golang.org/x/term"
+	"tailscale.com/client/tailscale"
+	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/ipn/store"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tsnet"
+	"tailscale.com/types/key"
 
 	"github.com/coder/pretty"
 	"github.com/coder/serpent"
@@ -181,6 +186,11 @@ func serveCmd() *serpent.Command {
 
 			ctx, ctxCancel := inv.SignalNotifyContext(ctx, os.Interrupt)
 			defer ctxCancel()
+			lc, err := ts.LocalClient()
+			if err != nil {
+				return fmt.Errorf("get local client: %w", err)
+			}
+			go monitorDirectConnections(ctx, lc, hlog)
 
 			closers = append(closers, ts)
 			<-ctx.Done()
@@ -221,6 +231,70 @@ func serveCmd() *serpent.Command {
 				Value:       serpent.StringOf(&derpmapFi),
 			},
 		},
+	}
+}
+
+type directConnectionEvent struct {
+	peer     string
+	endpoint string
+}
+
+type directConnectionTracker map[key.NodePublic]string
+
+func (tracker directConnectionTracker) update(status *ipnstate.Status) []directConnectionEvent {
+	seen := make(map[key.NodePublic]bool, len(status.Peer))
+	events := make([]directConnectionEvent, 0)
+	for nodeKey, peer := range status.Peer {
+		seen[nodeKey] = true
+		if peer == nil || peer.CurAddr == "" {
+			delete(tracker, nodeKey)
+			continue
+		}
+		if tracker[nodeKey] == peer.CurAddr {
+			continue
+		}
+		tracker[nodeKey] = peer.CurAddr
+
+		peerLabel := nodeKey.ShortString()
+		if len(peer.TailscaleIPs) > 0 {
+			peerLabel = peer.TailscaleIPs[0].String()
+		}
+		events = append(events, directConnectionEvent{
+			peer:     peerLabel,
+			endpoint: peer.CurAddr,
+		})
+	}
+	for nodeKey := range tracker {
+		if !seen[nodeKey] {
+			delete(tracker, nodeKey)
+		}
+	}
+	sort.Slice(events, func(i, j int) bool {
+		if events[i].peer == events[j].peer {
+			return events[i].endpoint < events[j].endpoint
+		}
+		return events[i].peer < events[j].peer
+	})
+	return events
+}
+
+func monitorDirectConnections(ctx context.Context, lc *tailscale.LocalClient, hlog func(string, ...any)) {
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	tracker := make(directConnectionTracker)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			status, err := lc.Status(ctx)
+			if err != nil {
+				continue
+			}
+			for _, event := range tracker.update(status) {
+				hlog("Peer %s connected directly via %s", event.peer, event.endpoint)
+			}
+		}
 	}
 }
 

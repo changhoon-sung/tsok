@@ -65,6 +65,8 @@ forwarding, port forwarding, `scp`, `rsync`, and IDE SSH integrations in the
 system OpenSSH client. The server's `port-forward` capability, enabled by
 default, must remain enabled. Multiple client processes may use the same wush
 auth key concurrently; stopped processes are removed from the active peer set.
+When a peer establishes a direct WireGuard path, `wush serve` reports the peer
+IP and its direct UDP endpoint. DERP remains available as the fallback path.
 
 [![asciicast](https://asciinema.org/a/ZrCNiRRkeHUi5Lj3fqC3ovLqi.svg)](https://asciinema.org/a/ZrCNiRRkeHUi5Lj3fqC3ovLqi)
 

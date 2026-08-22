@@ -25,7 +25,8 @@ On the host machine:
 
 ```bash
 $ wush serve
-01:26:50 [INFO] Picked DERP region Toronto as overlay home
+01:26:50 Picked DERP region Toronto as overlay home
+
 Your auth key is:
     >  <auth-key>
 Use this key to authenticate other wush commands to this instance.
@@ -66,10 +67,10 @@ forwarding, port forwarding, `scp`, `rsync`, and IDE SSH integrations in the
 system OpenSSH client. The server's `port-forward` capability, enabled by
 default, must remain enabled. Multiple client processes may use the same wush
 auth key concurrently; stopped processes are removed from the active peer set.
-Runtime logs use a timestamp and color-coded status tag. When a peer establishes
-a direct WireGuard path, `wush serve` reports `[DIRECT]`, the peer IP, and its
-UDP endpoint. If a direct path is unavailable, it reports `[DERP]` together
-with the relay region name and code, for example `Toronto (tor)`.
+Runtime logs use a consistent timestamp. When a peer establishes a direct
+WireGuard path, `wush serve` reports the peer IP and its UDP endpoint. If a
+direct path is unavailable, it reports the relay region name and code, for
+example `Toronto (tor)`.
 
 [![asciicast](https://asciinema.org/a/ZrCNiRRkeHUi5Lj3fqC3ovLqi.svg)](https://asciinema.org/a/ZrCNiRRkeHUi5Lj3fqC3ovLqi)
 

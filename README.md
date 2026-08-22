@@ -74,6 +74,19 @@ auth key concurrently; stopped processes are removed from the active peer set.
 > Tailscale's public [DERP relays](https://tailscale.com/kb/1232/derp-servers),
 > but no Tailscale account is required.
 
+## Build from source
+
+Building from source requires Go 1.27 or newer. From the repository root:
+
+```bash
+mkdir -p dist
+CGO_ENABLED=0 go build -trimpath -o dist/wush ./cmd/wush
+./dist/wush --help
+```
+
+The resulting `dist/wush` is a self-contained binary for the current operating
+system and architecture.
+
 ## Install
 
 Install the latest Linux or macOS release for `amd64` or `arm64`:

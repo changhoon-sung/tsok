@@ -160,11 +160,14 @@ func TestBridgeStdioCancellation(t *testing.T) {
 	}
 }
 
-func TestServeOpenSSHHelp(t *testing.T) {
+func TestServeConnectionHelp(t *testing.T) {
 	t.Parallel()
 
-	got := serveOpenSSHHelp("test-auth-key", "alice")
-	want := `Connect with OpenSSH:
+	got := serveConnectionHelp("test-auth-key", "alice", true, true)
+	want := `Open a zero-configuration shell:
+WUSH_AUTH_KEY=test-auth-key wush shell
+
+Connect with system OpenSSH:
 WUSH_AUTH_KEY=test-auth-key ssh -o 'ProxyCommand=wush connect --stdio --quiet 127.0.0.1:%p' alice@wush
 
 Or add this block to ~/.ssh/config:
@@ -174,13 +177,25 @@ Host wush
   ProxyCommand env WUSH_AUTH_KEY=test-auth-key wush connect --stdio --quiet 127.0.0.1:%p
 `
 	if got != want {
-		t.Fatalf("OpenSSH help:\n%s\nwant:\n%s", got, want)
+		t.Fatalf("connection help:\n%s\nwant:\n%s", got, want)
 	}
 	if !strings.HasSuffix(got, "\n") {
-		t.Fatal("OpenSSH help must leave a blank line after the config block")
+		t.Fatal("connection help must leave a blank line after the config block")
 	}
 	if strings.Contains(got, "--auth-key") {
-		t.Fatal("OpenSSH help passes the auth key in argv")
+		t.Fatal("connection help passes the auth key in argv")
+	}
+
+	shellOnly := serveConnectionHelp("test-auth-key", "alice", true, false)
+	if want := "Open a zero-configuration shell:\nWUSH_AUTH_KEY=test-auth-key wush shell\n"; shellOnly != want {
+		t.Fatalf("shell-only help = %q, want %q", shellOnly, want)
+	}
+	openSSHOnly := serveConnectionHelp("test-auth-key", "alice", false, true)
+	if strings.Contains(openSSHOnly, "wush shell") || !strings.Contains(openSSHOnly, "Connect with system OpenSSH:") {
+		t.Fatalf("OpenSSH-only help contains unexpected routes: %q", openSSHOnly)
+	}
+	if got := serveConnectionHelp("test-auth-key", "alice", false, false); got != "" {
+		t.Fatalf("disabled connection help = %q, want empty", got)
 	}
 }
 
@@ -311,7 +326,7 @@ func TestWaitUntilHasPeerHasIPAndPathReportsRelay(t *testing.T) {
 	}
 }
 
-func TestNegotiateSSHDirectConnection(t *testing.T) {
+func TestNegotiateShellDirectConnection(t *testing.T) {
 	t.Parallel()
 
 	peerIP := netip.MustParseAddr("fd7a:115c:a1e0::2")
@@ -324,7 +339,7 @@ func TestNegotiateSSHDirectConnection(t *testing.T) {
 		logs = append(logs, fmt.Sprintf(format, args...))
 	}
 
-	if err := negotiateSSHDirectConnection(context.Background(), logf, client, "lax", false, time.Second); err != nil {
+	if err := negotiateShellDirectConnection(context.Background(), logf, client, "lax", false, time.Second); err != nil {
 		t.Fatal(err)
 	}
 	got := strings.Join(logs, "\n")
@@ -333,7 +348,7 @@ func TestNegotiateSSHDirectConnection(t *testing.T) {
 	}
 }
 
-func TestNegotiateSSHDirectConnectionFallsBackToRelay(t *testing.T) {
+func TestNegotiateShellDirectConnectionFallsBackToRelay(t *testing.T) {
 	t.Parallel()
 
 	peerIP := netip.MustParseAddr("fd7a:115c:a1e0::2")
@@ -346,7 +361,7 @@ func TestNegotiateSSHDirectConnectionFallsBackToRelay(t *testing.T) {
 		logs = append(logs, fmt.Sprintf(format, args...))
 	}
 
-	if err := negotiateSSHDirectConnection(context.Background(), logf, client, "lax", false, time.Millisecond); err != nil {
+	if err := negotiateShellDirectConnection(context.Background(), logf, client, "lax", false, time.Millisecond); err != nil {
 		t.Fatal(err)
 	}
 	got := strings.Join(logs, "\n")

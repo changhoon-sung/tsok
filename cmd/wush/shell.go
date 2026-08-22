@@ -18,14 +18,14 @@ import (
 	xssh "github.com/coder/wush/xssh"
 )
 
-const sshDirectNegotiationTimeout = 5 * time.Second
+const shellDirectNegotiationTimeout = 5 * time.Second
 
 type peerStatusClient interface {
 	Status(context.Context) (*ipnstate.Status, error)
 	Ping(context.Context, netip.Addr, tailcfg.PingType) (*ipnstate.PingResult, error)
 }
 
-func sshCmd() *serpent.Command {
+func shellCmd() *serpent.Command {
 	var (
 		verbose   bool
 		quiet     bool
@@ -38,10 +38,24 @@ func sshCmd() *serpent.Command {
 		send        = new(overlay.Send)
 	)
 	return &serpent.Command{
-		Use:     "ssh",
+		Use:     "shell [command...]",
 		Aliases: []string{},
-		Short:   "Open a SSH connection to a wush server.",
-		Long:    "Use " + cliui.Code("wush serve") + " on the computer you would like to connect to.",
+		Short:   "Open a zero-configuration shell on a wush server.",
+		Long: "Open an interactive shell or run one command as the user running " + cliui.Code("wush serve") + "." +
+			"\n\nThe auth key grants that user's shell privileges. If " + cliui.Code("wush serve") +
+			" runs as root, the auth key grants a root shell." +
+			"\n\nFor SFTP, agent forwarding, per-user SSH authentication, SSH certificates, or SSH port forwarding," +
+			" use system OpenSSH with " + cliui.Code("wush connect --stdio") + "." +
+			"\n\n" + formatExamples(
+			example{
+				Description: "Open an interactive shell",
+				Command:     "WUSH_AUTH_KEY=<auth-key> wush shell",
+			},
+			example{
+				Description: "Run one remote command",
+				Command:     "WUSH_AUTH_KEY=<auth-key> wush shell -- uname -a",
+			},
+		),
 		Middleware: serpent.Chain(
 			initLogger(&verbose, &quiet, logger, &logf),
 			initAuth(&overlayOpts.authKey, &overlayOpts.clientAuth),
@@ -87,7 +101,7 @@ func sshCmd() *serpent.Command {
 			}
 
 			if !direct && (!quiet || overlayOpts.waitP2P) {
-				if err := negotiateSSHDirectConnection(ctx, logf, lc, relay, overlayOpts.waitP2P, sshDirectNegotiationTimeout); err != nil {
+				if err := negotiateShellDirectConnection(ctx, logf, lc, relay, overlayOpts.waitP2P, shellDirectNegotiationTimeout); err != nil {
 					return err
 				}
 			}
@@ -183,7 +197,7 @@ func waitUntilHasPeerHasIPAndPath(ctx context.Context, logF func(str string, arg
 	}
 }
 
-func negotiateSSHDirectConnection(ctx context.Context, logF func(str string, args ...any), lc peerStatusClient, relay string, wait bool, timeout time.Duration) error {
+func negotiateShellDirectConnection(ctx context.Context, logF func(str string, args ...any), lc peerStatusClient, relay string, wait bool, timeout time.Duration) error {
 	logF("Negotiating direct connection...")
 	if wait {
 		return waitUntilHasP2P(ctx, logF, lc)

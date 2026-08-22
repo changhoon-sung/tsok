@@ -27,7 +27,7 @@ func main() {
 			},
 			example{
 				Description: "Open a shell to a wush server",
-				Command:     "wush ssh",
+				Command:     "wush shell",
 			},
 			example{
 				Description: "Copy a single file to a wush server",
@@ -43,7 +43,7 @@ func main() {
 		Children: []*serpent.Command{
 			versionCmd(),
 			licensesCmd(),
-			sshCmd(),
+			shellCmd(),
 			connectCmd(),
 			serveCmd(),
 			cpCmd(),

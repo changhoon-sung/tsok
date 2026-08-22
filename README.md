@@ -31,7 +31,10 @@ Your auth key is:
     >  <auth-key>
 Use this key to authenticate other wush commands to this instance.
 
-Connect with OpenSSH:
+Open a zero-configuration shell:
+WUSH_AUTH_KEY=<auth-key> wush shell
+
+Connect with system OpenSSH:
 WUSH_AUTH_KEY=<auth-key> ssh -o 'ProxyCommand=wush connect --stdio --quiet 127.0.0.1:%p' coder@wush
 
 Or add this block to ~/.ssh/config:
@@ -50,8 +53,11 @@ $ WUSH_AUTH_KEY=<auth-key> wush cp 1gb.txt
 Uploading "1gb.txt" 100% |██████████████████████████████████████████████| (2.1/2.1 GB, 376 MB/s)
 
 # Open a shell to the host
-$ WUSH_AUTH_KEY=<auth-key> wush ssh
+$ WUSH_AUTH_KEY=<auth-key> wush shell
 coder@colin:~$
+
+# Run one command as the wush serve user
+$ WUSH_AUTH_KEY=<auth-key> wush shell -- uname -a
 
 # Or use the system OpenSSH client without a local listening port
 $ WUSH_AUTH_KEY=<auth-key> ssh -o 'ProxyCommand=wush connect --stdio --quiet 127.0.0.1:%p' coder@wush
@@ -60,9 +66,30 @@ $ WUSH_AUTH_KEY=<auth-key> ssh -o 'ProxyCommand=wush connect --stdio --quiet 127
 $ ssh wush
 ```
 
-Before starting `wush ssh`, the client checks its current path. If it is already
-direct, the client reports `Peer connection: direct`. If the peer is first
-reachable over DERP, it reports `Peer reachable via relay (<region>)` and
+`wush shell` is a zero-configuration remote shell, not a complete OpenSSH
+replacement. It needs no `sshd`, host key, `authorized_keys`, separate account
+configuration, or system service on the host. It provides a PTY-backed
+interactive shell and single remote command execution as the user running
+`wush serve`. The encrypted wush overlay authenticates the connection, so the
+auth key is a bearer credential for that user's shell privileges.
+
+> [!WARNING]
+> If `wush serve` runs as root, anyone holding its auth key can open a root
+> shell. Treat the auth key as a root credential in that configuration.
+
+| Command | Intended use |
+| --- | --- |
+| `wush shell` | Zero-configuration, one-off shell or remote command |
+| `wush connect --stdio` | General TCP transport over the wush overlay |
+| System `ssh` | Multiple users and complete OpenSSH features |
+
+The built-in shell does not aim to provide per-user SSH authentication, SFTP,
+agent forwarding, SSH certificates, or SSH port forwarding. Those features
+remain the responsibility of system OpenSSH over `wush connect --stdio`.
+
+Before starting `wush shell`, the client checks its current path. If it is
+already direct, the client reports `Peer connection: direct`. If the peer is
+first reachable over DERP, it reports `Peer reachable via relay (<region>)` and
 `Negotiating direct connection...`, then probes for a direct UDP path for up to
 five seconds. It either reports `Peer connection: direct` or
 `Direct connection unavailable; continuing via relay (<region>)`.

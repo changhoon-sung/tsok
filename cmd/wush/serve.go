@@ -69,6 +69,7 @@ func serveCmd() *serpent.Command {
 			go r.ListenOverlayDERP(ctx)
 
 			authKey := r.ClientAuth().AuthKey()
+			shellEnabled := slices.Contains(enabled, "shell") && !slices.Contains(disabled, "shell")
 			portForwardEnabled := slices.Contains(enabled, "port-forward") && !slices.Contains(disabled, "port-forward")
 
 			// Ensure we always print the auth key on stdout.
@@ -76,8 +77,8 @@ func serveCmd() *serpent.Command {
 				plainf("\n%s", cliui.Bold("Your auth key is:"))
 				fmt.Println("  >", cliui.Code(authKey))
 				plainf("Use this key to authenticate other wush commands to this instance.")
-				if portForwardEnabled {
-					plainf("\n%s", serveOpenSSHHelp(authKey, serveUsername()))
+				if shellEnabled || portForwardEnabled {
+					plainf("\n%s", serveConnectionHelp(authKey, serveUsername(), shellEnabled, portForwardEnabled))
 				}
 			} else {
 				fmt.Println(cliui.Code(authKey))
@@ -108,7 +109,7 @@ func serveCmd() *serpent.Command {
 
 			closers := []io.Closer{}
 
-			if slices.Contains(enabled, "ssh") && !slices.Contains(disabled, "ssh") {
+			if shellEnabled {
 				sshSrv, err := xssh.NewServer()
 				if err != nil {
 					return err
@@ -124,11 +125,11 @@ func serveCmd() *serpent.Command {
 				go func() {
 					err := sshSrv.Serve(sshListener)
 					if err != nil && ctx.Err() == nil {
-						humanLog.error("SSH server exited: %s", err)
+						humanLog.error("Shell server exited: %s", err)
 					}
 				}()
 			} else {
-				humanLog.warn("SSH server %s", pretty.Sprint(cliui.DefaultStyles.Disabled, "disabled"))
+				humanLog.warn("Shell server %s", pretty.Sprint(cliui.DefaultStyles.Disabled, "disabled"))
 			}
 
 			if slices.Contains(enabled, "cp") && !slices.Contains(disabled, "cp") {
@@ -189,14 +190,14 @@ func serveCmd() *serpent.Command {
 			{
 				Flag:        "enable",
 				Description: "Server options to enable.",
-				Default:     "ssh,cp,port-forward",
-				Value:       serpent.EnumArrayOf(&enabled, "ssh", "cp", "port-forward"),
+				Default:     "shell,cp,port-forward",
+				Value:       serpent.EnumArrayOf(&enabled, "shell", "cp", "port-forward"),
 			},
 			{
 				Flag:        "disable",
 				Description: "Server options to disable.",
 				Default:     "",
-				Value:       serpent.EnumArrayOf(&disabled, "ssh", "cp", "port-forward"),
+				Value:       serpent.EnumArrayOf(&disabled, "shell", "cp", "port-forward"),
 			},
 			{
 				Flag:        "derp-config-file",
@@ -358,27 +359,39 @@ func serveUsername() string {
 	return "user"
 }
 
-func serveOpenSSHHelp(authKey, username string) string {
+func serveConnectionHelp(authKey, username string, shellEnabled, openSSHEnabled bool) string {
 	authAssignment := "WUSH_AUTH_KEY=" + authKey
+	sections := make([]string, 0, 3)
+	if shellEnabled {
+		sections = append(sections, fmt.Sprintf("%s\n%s wush shell",
+			cliui.Bold("Open a zero-configuration shell:"), authAssignment))
+	}
+	if !openSSHEnabled {
+		if len(sections) == 0 {
+			return ""
+		}
+		return strings.Join(sections, "\n\n") + "\n"
+	}
+
 	proxyOption := "'ProxyCommand=wush connect --stdio --quiet 127.0.0.1:%p'"
 	command := fmt.Sprintf("%s ssh -o %s %s@wush", authAssignment, proxyOption, username)
 	proxyCommand := fmt.Sprintf("env %s wush connect --stdio --quiet 127.0.0.1:%%p", authAssignment)
-	return fmt.Sprintf(`%s
+	sections = append(sections, fmt.Sprintf(`%s
 %s
 
 %s
 %s
   HostName wush
   User %s
-  %s %s
-`,
-		cliui.Bold("Connect with OpenSSH:"),
+  %s %s`,
+		cliui.Bold("Connect with system OpenSSH:"),
 		command,
 		cliui.Bold("Or add this block to ~/.ssh/config:"),
 		cliui.Bold("Host wush"),
 		username,
 		"ProxyCommand", proxyCommand,
-	)
+	))
+	return strings.Join(sections, "\n\n") + "\n"
 }
 
 func newTSNet(direction string, verbose bool, controlURL string) (*tsnet.Server, error) {

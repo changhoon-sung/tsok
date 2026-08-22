@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log/slog"
 	"net/netip"
@@ -50,13 +49,7 @@ func sshCmd() *serpent.Command {
 			}
 			defer s.Close()
 
-			if send.Auth.ReceiverDERPRegionID != 0 {
-				go send.ListenOverlayDERP(ctx)
-			} else if send.Auth.ReceiverStunAddr.IsValid() {
-				go send.ListenOverlaySTUN(ctx)
-			} else {
-				return errors.New("auth key provided neither DERP nor STUN")
-			}
+			go send.ListenOverlayDERP(ctx)
 
 			go func() {
 				if err := s.ListenAndServe(ctx); err != nil {
@@ -107,11 +100,6 @@ func sshCmd() *serpent.Command {
 				Description: "File which specifies the DERP config to use. In the structure of https://pkg.go.dev/tailscale.com/tailcfg#DERPMap.",
 				Default:     "",
 				Value:       serpent.StringOf(&derpmapFi),
-			},
-			{
-				Flag:    "stun-ip-override",
-				Default: "",
-				Value:   serpent.StringOf(&overlayOpts.stunAddrOverride),
 			},
 			{
 				Flag:        "quiet",

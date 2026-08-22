@@ -79,11 +79,6 @@ func rsyncCmd() *serpent.Command {
 				Value:       serpent.StringOf(&overlayOpts.authKey),
 			},
 			{
-				Flag:    "stun-ip-override",
-				Default: "",
-				Value:   serpent.StringOf(&overlayOpts.stunAddrOverride),
-			},
-			{
 				Flag:        "wait-p2p",
 				Description: "Waits for the connection to be p2p.",
 				Default:     "false",
@@ -102,9 +97,6 @@ func rsyncCmd() *serpent.Command {
 
 func buildRsyncArgs(progPath string, args []string, overlayOpts *sendOverlayOpts, verbose bool) []string {
 	remoteShell := []string{progPath, "ssh", "--quiet"}
-	if overlayOpts.stunAddrOverride != "" {
-		remoteShell = append(remoteShell, "--stun-ip-override", overlayOpts.stunAddrOverride)
-	}
 	if overlayOpts.waitP2P {
 		remoteShell = append(remoteShell, "--wait-p2p")
 	}

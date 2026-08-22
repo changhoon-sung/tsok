@@ -2,7 +2,6 @@ package main
 
 import (
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -76,20 +75,12 @@ func initAuth(authFlag *string, ca *overlay.ClientAuth) serpent.MiddlewareFunc {
 func sendOverlayMW(opts *sendOverlayOpts, send **overlay.Send, logger *slog.Logger, dm *tailcfg.DERPMap, logf *func(str string, args ...any)) serpent.MiddlewareFunc {
 	return func(next serpent.HandlerFunc) serpent.HandlerFunc {
 		return func(i *serpent.Invocation) error {
-			var err error
-
 			if regionID := opts.clientAuth.ReceiverDERPRegionID; regionID != 0 && dm.Regions[int(regionID)] == nil {
 				return fmt.Errorf("auth key references unknown DERP region %d", regionID)
 			}
 
 			newSend := overlay.NewSendOverlay(logger, dm)
 			newSend.Auth = opts.clientAuth
-			if opts.stunAddrOverride != "" {
-				newSend.STUNIPOverride, err = netip.ParseAddr(opts.stunAddrOverride)
-				if err != nil {
-					return fmt.Errorf("parse stun addr override: %w", err)
-				}
-			}
 
 			newSend.Auth.PrintDebug(*logf, dm)
 
@@ -125,10 +116,9 @@ func derpMap(fi *string, dm *tailcfg.DERPMap) serpent.MiddlewareFunc {
 }
 
 type sendOverlayOpts struct {
-	authKey          string
-	clientAuth       overlay.ClientAuth
-	waitP2P          bool
-	stunAddrOverride string
+	authKey    string
+	clientAuth overlay.ClientAuth
+	waitP2P    bool
 }
 
 func cpCmd() *serpent.Command {
@@ -183,13 +173,7 @@ func cpCmd() *serpent.Command {
 			}
 			defer s.Close()
 
-			if send.Auth.ReceiverDERPRegionID != 0 {
-				go send.ListenOverlayDERP(ctx)
-			} else if send.Auth.ReceiverStunAddr.IsValid() {
-				go send.ListenOverlaySTUN(ctx)
-			} else {
-				return errors.New("auth key provided neither DERP nor STUN")
-			}
+			go send.ListenOverlayDERP(ctx)
 
 			go func() {
 				if err := s.ListenAndServe(ctx); err != nil {
@@ -269,11 +253,6 @@ func cpCmd() *serpent.Command {
 				Description: "File which specifies the DERP config to use. In the structure of https://pkg.go.dev/tailscale.com/tailcfg#DERPMap. By default, https://controlplane.tailscale.com/derpmap/default is used.",
 				Default:     "",
 				Value:       serpent.StringOf(&derpmapFi),
-			},
-			{
-				Flag:    "stun-ip-override",
-				Default: "",
-				Value:   serpent.StringOf(&overlayOpts.stunAddrOverride),
 			},
 			{
 				Flag:        "wait-p2p",

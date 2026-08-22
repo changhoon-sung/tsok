@@ -9,13 +9,11 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"net"
 	"net/netip"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/pion/stun/v3"
 	"tailscale.com/derp"
 	"tailscale.com/derp/derphttp"
 	"tailscale.com/net/netcheck"
@@ -25,7 +23,6 @@ import (
 	"tailscale.com/types/key"
 	"tailscale.com/util/eventbus"
 
-	"github.com/coder/pretty"
 	"github.com/coder/wush/cliui"
 )
 
@@ -47,27 +44,13 @@ const (
 	peerInactiveTimeout   = 2 * time.Minute
 )
 
-type peerTransport uint8
-
-const (
-	peerTransportSTUN peerTransport = iota + 1
-	peerTransportDERP
-)
-
 type peerSource struct {
-	transport peerTransport
-	stunAddr  netip.AddrPort
-	derpKey   key.NodePublic
+	derpKey key.NodePublic
 }
 
 type receivePeer struct {
 	source   peerSource
 	lastSeen time.Time
-}
-
-type stunPeer struct {
-	sessionID string
-	addr      netip.AddrPort
 }
 
 type derpPeer struct {
@@ -87,11 +70,7 @@ type Receive struct {
 	// key would allow anyone to connect.
 	PeerPriv key.NodePrivate
 
-	// stunIP is the STUN address that can be used for P2P overlay
-	// communication.
-	stunIP netip.AddrPort
-	// derpRegionID is the DERP region that can be used for proxied overlay
-	// communication.
+	// derpRegionID is the DERP region used for overlay communication.
 	derpRegionID uint16
 
 	lastNode atomic.Pointer[tailcfg.Node]
@@ -149,7 +128,6 @@ func (r *Receive) ClientAuth() *ClientAuth {
 	return &ClientAuth{
 		OverlayPrivateKey:    r.PeerPriv,
 		ReceiverPublicKey:    r.SelfPriv.Public(),
-		ReceiverStunAddr:     r.stunIP,
 		ReceiverDERPRegionID: r.derpRegionID,
 	}
 }
@@ -163,140 +141,6 @@ func (r *Receive) SendTailscaleNodeUpdate(node *tailcfg.Node) {
 		Typ:  messageTypeNodeUpdate,
 		Node: *node.Clone(),
 	}
-}
-
-func (r *Receive) ListenOverlaySTUN(ctx context.Context) (<-chan struct{}, error) {
-	srvAddr, err := net.ResolveUDPAddr("udp4", "stun.l.google.com:19302")
-	if err != nil {
-		return nil, fmt.Errorf("resolve google STUN: %w", err)
-	}
-
-	conn, err := net.ListenUDP("udp4", nil)
-	if err != nil {
-		return nil, fmt.Errorf("listen STUN: %w", err)
-	}
-	r.startPeerReaper(ctx)
-
-	go func() {
-		<-ctx.Done()
-		_ = conn.Close()
-	}()
-
-	m := stun.MustBuild(stun.TransactionID, stun.BindingRequest)
-
-	restun := time.NewTicker(time.Nanosecond)
-
-	go func() {
-		defer restun.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-
-			case <-restun.C:
-				if _, writeErr := conn.WriteToUDP(m.Raw, srvAddr); writeErr != nil {
-					r.HumanLogf("Failed to write STUN request on overlay: %s", writeErr)
-				}
-				restun.Reset(30 * time.Second)
-			}
-		}
-	}()
-
-	go func() {
-		for {
-
-			select {
-			case <-ctx.Done():
-				return
-			case msg := <-r.out:
-				if msg.Typ == messageTypeNodeUpdate {
-					r.lastNode.Store(&msg.Node)
-				}
-				for _, peer := range r.stunPeers() {
-					peerMsg := *msg
-					peerMsg.SessionID = peer.sessionID
-					raw, err := json.Marshal(peerMsg)
-					if err != nil {
-						panic("marshal overlay msg: " + err.Error())
-					}
-					sealed := r.SelfPriv.SealTo(r.PeerPriv.Public(), raw)
-					if _, writeErr := conn.WriteToUDPAddrPort(sealed, peer.addr); writeErr != nil {
-						r.HumanLogf("Failed to send updated node over udp: %s", writeErr)
-					}
-				}
-			}
-		}
-	}()
-
-	ipChan := make(chan struct{})
-
-	go func() {
-		var closeIPChanOnce sync.Once
-
-		for {
-			buf := make([]byte, 4<<10)
-			n, addr, err := conn.ReadFromUDPAddrPort(buf)
-			if err != nil {
-				r.Logger.Error("read from STUN; exiting", "err", err)
-				return
-			}
-
-			buf = buf[:n]
-			if stun.IsMessage(buf) {
-				m := new(stun.Message)
-				m.Raw = buf
-
-				if err := m.Decode(); err != nil {
-					r.Logger.Error("decode STUN message; exiting", "err", err)
-					return
-				}
-
-				var xorAddr stun.XORMappedAddress
-				if err := xorAddr.GetFrom(m); err != nil {
-					r.Logger.Error("decode STUN xor mapped addr; exiting", "err", err)
-					return
-				}
-
-				stunAddr, ok := netip.AddrFromSlice(xorAddr.IP)
-				if !ok {
-					r.Logger.Error("convert STUN xor mapped addr", "ip", xorAddr.IP.String())
-					continue
-				}
-				stunAddrPort := netip.AddrPortFrom(stunAddr, uint16(xorAddr.Port))
-
-				// our first STUN response
-				if !r.stunIP.IsValid() {
-					r.HumanLogf("STUN address is %s", stunAddrPort.String())
-				}
-
-				if r.stunIP.IsValid() && r.stunIP.Compare(stunAddrPort) != 0 {
-					r.HumanLogf(pretty.Sprintf(cliui.DefaultStyles.Warn, "STUN address changed, this may cause issues; %s->%s", r.stunIP.String(), stunAddrPort.String()))
-				}
-				r.stunIP = stunAddrPort
-				closeIPChanOnce.Do(func() {
-					close(ipChan)
-				})
-				continue
-			}
-
-			res, err := r.handleNextMessage(peerSource{
-				transport: peerTransportSTUN,
-				stunAddr:  addr,
-			}, buf, "STUN")
-			if err != nil {
-				r.HumanLogf("Failed to handle overlay message: %s", err.Error())
-				continue
-			}
-
-			if res != nil {
-				if _, writeErr := conn.WriteToUDPAddrPort(res, addr); writeErr != nil {
-					r.HumanLogf("Failed to send overlay response over STUN: %s", writeErr.Error())
-					return
-				}
-			}
-		}
-	}()
-	return ipChan, nil
 }
 
 func (r *Receive) ListenOverlayDERP(ctx context.Context) error {
@@ -345,8 +189,7 @@ func (r *Receive) ListenOverlayDERP(ctx context.Context) error {
 		switch msg := msg.(type) {
 		case derp.ReceivedPacket:
 			res, err := r.handleNextMessage(peerSource{
-				transport: peerTransportDERP,
-				derpKey:   msg.Source,
+				derpKey: msg.Source,
 			}, msg.Data, "DERP")
 			if err != nil {
 				r.HumanLogf("Failed to handle overlay message from %s: %s", msg.Source.ShortString(), err.Error())
@@ -433,17 +276,8 @@ func (r *Receive) trackPeer(sessionID string, source peerSource, typ messageType
 	if sessionID == "" {
 		return false, errors.New("overlay session ID is empty")
 	}
-	switch source.transport {
-	case peerTransportSTUN:
-		if !source.stunAddr.IsValid() {
-			return false, errors.New("overlay STUN peer address is invalid")
-		}
-	case peerTransportDERP:
-		if source.derpKey.IsZero() {
-			return false, errors.New("overlay DERP peer key is empty")
-		}
-	default:
-		return false, errors.New("overlay peer transport is invalid")
+	if source.derpKey.IsZero() {
+		return false, errors.New("overlay DERP peer key is empty")
 	}
 	r.peerMu.Lock()
 	if r.peers == nil {
@@ -469,26 +303,12 @@ func (r *Receive) trackPeer(sessionID string, source peerSource, typ messageType
 	return false, nil
 }
 
-func (r *Receive) stunPeers() []stunPeer {
-	r.peerMu.Lock()
-	defer r.peerMu.Unlock()
-	peers := make([]stunPeer, 0, len(r.peers))
-	for sessionID, peer := range r.peers {
-		if peer.source.transport == peerTransportSTUN {
-			peers = append(peers, stunPeer{sessionID: sessionID, addr: peer.source.stunAddr})
-		}
-	}
-	return peers
-}
-
 func (r *Receive) derpPeers() []derpPeer {
 	r.peerMu.Lock()
 	defer r.peerMu.Unlock()
 	peers := make([]derpPeer, 0, len(r.peers))
 	for sessionID, peer := range r.peers {
-		if peer.source.transport == peerTransportDERP {
-			peers = append(peers, derpPeer{sessionID: sessionID, key: peer.source.derpKey})
-		}
+		peers = append(peers, derpPeer{sessionID: sessionID, key: peer.source.derpKey})
 	}
 	return peers
 }
@@ -496,7 +316,7 @@ func (r *Receive) derpPeers() []derpPeer {
 func (r *Receive) removeDERPPeers(peerKey key.NodePublic) {
 	r.peerMu.Lock()
 	for sessionID, peer := range r.peers {
-		if peer.source.transport == peerTransportDERP && peer.source.derpKey == peerKey {
+		if peer.source.derpKey == peerKey {
 			delete(r.peers, sessionID)
 			r.in <- PeerUpdate{ID: sessionID}
 		}

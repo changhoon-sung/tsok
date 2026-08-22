@@ -9,7 +9,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"net"
 	"net/netip"
 	"os"
 	"os/user"
@@ -39,9 +38,8 @@ func NewSendOverlay(logger *slog.Logger, dm *tailcfg.DERPMap) *Send {
 }
 
 type Send struct {
-	Logger         *slog.Logger
-	STUNIPOverride netip.Addr
-	derpMap        *tailcfg.DERPMap
+	Logger  *slog.Logger
+	derpMap *tailcfg.DERPMap
 
 	SelfIP    netip.Addr
 	SessionID string
@@ -70,117 +68,6 @@ func (s *Send) SendTailscaleNodeUpdate(node *tailcfg.Node) {
 		Typ:       messageTypeNodeUpdate,
 		SessionID: s.SessionID,
 		Node:      *node.Clone(),
-	}
-}
-
-func (s *Send) ListenOverlaySTUN(ctx context.Context) error {
-	conn, err := net.ListenUDP("udp4", nil)
-	if err != nil {
-		return fmt.Errorf("listen STUN: %w", err)
-	}
-
-	sealed := s.newHelloPacket()
-	receiverAddr := s.Auth.ReceiverStunAddr
-	if s.STUNIPOverride.IsValid() {
-		receiverAddr = netip.AddrPortFrom(s.STUNIPOverride, s.Auth.ReceiverStunAddr.Port())
-	}
-
-	_, err = conn.WriteToUDPAddrPort(sealed, receiverAddr)
-	if err != nil {
-		return fmt.Errorf("send overlay hello over STUN: %w", err)
-	}
-
-	s.setCloseFunc(func() {
-		_ = conn.SetWriteDeadline(time.Now().Add(time.Second))
-		_, _ = conn.WriteToUDPAddrPort(s.sealMessage(overlayMessage{
-			Typ:       messageTypeGoodbye,
-			SessionID: s.SessionID,
-		}), receiverAddr)
-		_ = conn.Close()
-	})
-	defer s.Close()
-	go func() {
-		select {
-		case <-ctx.Done():
-			s.Close()
-		case <-s.done:
-		}
-	}()
-
-	keepAlive := time.NewTicker(peerKeepAliveInterval)
-	defer keepAlive.Stop()
-
-	go func() {
-		for {
-			select {
-			case <-s.done:
-				return
-			case <-ctx.Done():
-				return
-			case msg := <-s.out:
-				raw, err := json.Marshal(msg)
-				if err != nil {
-					panic("marshal overlay msg: " + err.Error())
-				}
-
-				sealed := s.Auth.OverlayPrivateKey.SealTo(s.Auth.ReceiverPublicKey, raw)
-				_, err = conn.WriteToUDPAddrPort(sealed, receiverAddr)
-				if err != nil {
-					fmt.Printf("send response over STUN: %s\n", err)
-					return
-				}
-
-			case <-keepAlive.C:
-				msg := overlayMessage{
-					Typ:       messageTypePing,
-					SessionID: s.SessionID,
-				}
-				raw, err := json.Marshal(msg)
-				if err != nil {
-					panic("marshal node: " + err.Error())
-				}
-
-				sealed := s.Auth.OverlayPrivateKey.SealTo(s.Auth.ReceiverPublicKey, raw)
-				_, err = conn.WriteToUDPAddrPort(sealed, receiverAddr)
-				if err != nil {
-					fmt.Printf("send ping message over STUN: %s\n", err)
-					return
-				}
-			}
-		}
-	}()
-
-	for {
-		buf := make([]byte, 4<<10)
-		n, addr, err := conn.ReadFromUDPAddrPort(buf)
-		if err != nil {
-			select {
-			case <-s.done:
-				return nil
-			default:
-			}
-			if errors.Is(err, net.ErrClosed) {
-				return nil
-			}
-			s.Logger.Error("read from STUN; exiting", "err", err)
-			return err
-		}
-
-		buf = buf[:n]
-
-		res, err := s.handleNextMessage(buf)
-		if err != nil {
-			fmt.Println(cliui.Timestamp(time.Now()), "Failed to handle overlay message:", err.Error())
-			continue
-		}
-
-		if res != nil {
-			_, err = conn.WriteToUDPAddrPort(res, addr)
-			if err != nil {
-				fmt.Println(cliui.Timestamp(time.Now()), "Failed to send overlay response over STUN:", err.Error())
-				return err
-			}
-		}
 	}
 }
 

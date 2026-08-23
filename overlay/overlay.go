@@ -34,6 +34,8 @@ const (
 	messageTypeHelloResponse
 	messageTypeNodeUpdate
 	messageTypeGoodbye
+	messageTypeOpenUDP
+	messageTypeOpenUDPResponse
 )
 
 type overlayMessage struct {
@@ -42,6 +44,10 @@ type overlayMessage struct {
 
 	HostInfo HostInfo
 	Node     tailcfg.Node
+
+	RequestID string
+	UDPPort   uint16
+	Error     string
 }
 
 type HostInfo struct {

@@ -1,6 +1,7 @@
 package overlay
 
 import (
+	"context"
 	"encoding/json"
 	"log/slog"
 	"strings"
@@ -185,6 +186,129 @@ func TestReceiveTracksSessionAcrossDERPKeyChange(t *testing.T) {
 	peers := receive.derpPeers()
 	if len(peers) != 1 || peers[0].key != secondSource.derpKey {
 		t.Fatalf("DERP peers = %#v, want session on updated DERP key", peers)
+	}
+}
+
+func TestReceiveOpensUDPForAuthenticatedSession(t *testing.T) {
+	t.Parallel()
+
+	receive := newTestReceive()
+	source := testPeerSource()
+	hello := sealReceiveMessage(t, receive, overlayMessage{Typ: messageTypeHello, SessionID: "session-a"})
+	if _, err := receive.handleNextMessage(source, hello, "test"); err != nil {
+		t.Fatal(err)
+	}
+
+	var gotSession string
+	var gotPort uint16
+	receive.SetOpenUDPHandler(func(sessionID string, port uint16) error {
+		gotSession, gotPort = sessionID, port
+		return nil
+	})
+	request := sealReceiveMessage(t, receive, overlayMessage{
+		Typ:       messageTypeOpenUDP,
+		SessionID: "session-a",
+		RequestID: "request-a",
+		UDPPort:   5353,
+	})
+	sealedResponse, err := receive.handleNextMessage(source, request, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotSession != "session-a" || gotPort != 5353 {
+		t.Fatalf("UDP handler = (%q, %d), want (session-a, 5353)", gotSession, gotPort)
+	}
+
+	cleartext, ok := receive.PeerPriv.OpenFrom(receive.SelfPriv.Public(), sealedResponse)
+	if !ok {
+		t.Fatal("decrypt UDP response")
+	}
+	var response overlayMessage
+	if err := json.Unmarshal(cleartext, &response); err != nil {
+		t.Fatal(err)
+	}
+	if response.Typ != messageTypeOpenUDPResponse || response.RequestID != "request-a" || response.UDPPort != 5353 || response.Error != "" {
+		t.Fatalf("UDP response = %#v", response)
+	}
+}
+
+func TestReceiveRejectsUDPWhenForwardingDisabled(t *testing.T) {
+	t.Parallel()
+
+	receive := newTestReceive()
+	source := testPeerSource()
+	hello := sealReceiveMessage(t, receive, overlayMessage{Typ: messageTypeHello, SessionID: "session-a"})
+	if _, err := receive.handleNextMessage(source, hello, "test"); err != nil {
+		t.Fatal(err)
+	}
+	request := sealReceiveMessage(t, receive, overlayMessage{
+		Typ: messageTypeOpenUDP, SessionID: "session-a", RequestID: "request-a", UDPPort: 53,
+	})
+	sealedResponse, err := receive.handleNextMessage(source, request, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cleartext, ok := receive.PeerPriv.OpenFrom(receive.SelfPriv.Public(), sealedResponse)
+	if !ok {
+		t.Fatal("decrypt UDP response")
+	}
+	var response overlayMessage
+	if err := json.Unmarshal(cleartext, &response); err != nil {
+		t.Fatal(err)
+	}
+	if response.Error != "UDP forwarding is disabled" {
+		t.Fatalf("UDP response error = %q", response.Error)
+	}
+}
+
+func TestSendOpenUDPCorrelatesResponse(t *testing.T) {
+	t.Parallel()
+
+	receiverPrivate := key.NewNode()
+	overlayPrivate := key.NewNode()
+	send := &Send{
+		Logger: slog.Default(), SessionID: "session-a",
+		Auth: ClientAuth{OverlayPrivateKey: overlayPrivate, ReceiverPublicKey: receiverPrivate.Public()},
+		out:  make(chan *overlayMessage, 1), done: make(chan struct{}),
+	}
+	result := make(chan error, 1)
+	go func() { result <- send.OpenUDP(context.Background(), 5353) }()
+	request := <-send.out
+	if request.Typ != messageTypeOpenUDP || request.SessionID != "session-a" || request.UDPPort != 5353 || request.RequestID == "" {
+		t.Fatalf("UDP request = %#v", request)
+	}
+	raw, err := json.Marshal(overlayMessage{
+		Typ: messageTypeOpenUDPResponse, SessionID: "session-a", RequestID: request.RequestID, UDPPort: 5353,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sealed := receiverPrivate.SealTo(overlayPrivate.Public(), raw)
+	if _, err := send.handleNextMessage(sealed); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-result; err != nil {
+		t.Fatalf("OpenUDP: %v", err)
+	}
+}
+
+func TestReceiveNotifiesUDPLeaseOnGoodbye(t *testing.T) {
+	t.Parallel()
+
+	receive := newTestReceive()
+	source := testPeerSource()
+	closed := make(chan string, 1)
+	receive.SetSessionClosedHandler(func(sessionID string) { closed <- sessionID })
+	hello := sealReceiveMessage(t, receive, overlayMessage{Typ: messageTypeHello, SessionID: "session-a"})
+	if _, err := receive.handleNextMessage(source, hello, "test"); err != nil {
+		t.Fatal(err)
+	}
+	goodbye := sealReceiveMessage(t, receive, overlayMessage{Typ: messageTypeGoodbye, SessionID: "session-a"})
+	if _, err := receive.handleNextMessage(source, goodbye, "test"); err != nil {
+		t.Fatal(err)
+	}
+	if sessionID := <-closed; sessionID != "session-a" {
+		t.Fatalf("closed session = %q", sessionID)
 	}
 }
 

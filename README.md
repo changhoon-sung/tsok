@@ -28,6 +28,18 @@ this to your shell profile:
 export PATH="$HOME/.local/bin:$PATH"
 ```
 
+Update an installed binary to the latest release:
+
+```bash
+tsok update
+```
+
+The updater downloads the same platform archive as the installer, verifies it
+against the release SHA-256 checksums, and atomically replaces the current
+executable. The running process finishes normally; the new version is used on
+the next invocation. The executable's directory must be writable by the
+current user.
+
 ## Quick start
 
 On the host machine:
@@ -84,6 +96,7 @@ rsync -av ./project/ tsok:/tmp/project/
 | Command | Purpose |
 | --- | --- |
 | `tsok serve` | Accept authenticated client connections |
+| `tsok update` | Replace the current executable with the latest release |
 | `tsok shell [command...]` | Open the built-in shell or run one command |
 | `tsok cp <file>` | Copy one local file to the host |
 | `tsok forward --tcp <local>:<remote>` | Forward a local TCP listener to host loopback |

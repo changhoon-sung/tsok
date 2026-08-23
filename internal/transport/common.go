@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"path/filepath"
 
 	"tailscale.com/ipn/store"
 	"tailscale.com/tailcfg"
@@ -70,8 +71,16 @@ func LoadDERPMap(ctx context.Context, path string) (*tailcfg.DERPMap, error) {
 }
 
 func newTSNet(direction string, opts CommonOptions, controlURL string) (*tsnet.Server, error) {
+	cacheDir, err := os.UserCacheDir()
+	if err != nil {
+		return nil, fmt.Errorf("get user cache directory: %w", err)
+	}
+	tsnetDir := filepath.Join(cacheDir, "tsok", "tsnet", direction)
+	if err := os.MkdirAll(tsnetDir, 0700); err != nil {
+		return nil, fmt.Errorf("create tsnet directory: %w", err)
+	}
 	srv := &tsnet.Server{
-		Dir:        os.TempDir(),
+		Dir:        tsnetDir,
 		Hostname:   "tsok-" + direction,
 		Ephemeral:  true,
 		AuthKey:    direction,

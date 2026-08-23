@@ -44,10 +44,9 @@ func main() {
 			versionCmd(),
 			licensesCmd(),
 			shellCmd(),
-			connectCmd(),
 			serveCmd(),
 			cpCmd(),
-			portForwardCmd(),
+			forwardCmd(),
 		},
 		Options: []serpent.Option{
 			{

@@ -1,7 +1,6 @@
 package main
 
 import (
-	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
@@ -13,112 +12,16 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/charmbracelet/huh"
 	"github.com/coder/serpent"
 	"github.com/coder/wush/cliui"
-	"github.com/coder/wush/overlay"
-	"github.com/coder/wush/tsserver"
 	"github.com/schollz/progressbar/v3"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/ptr"
 )
 
-func initLogger(verbose, quiet *bool, slogger *slog.Logger, logf *func(str string, args ...any)) serpent.MiddlewareFunc {
-	return func(next serpent.HandlerFunc) serpent.HandlerFunc {
-		return func(i *serpent.Invocation) error {
-			if *verbose {
-				*slogger = *slog.New(slog.NewTextHandler(i.Stderr, nil))
-			} else {
-				*slogger = *slog.New(slog.NewTextHandler(io.Discard, nil))
-			}
-
-			*logf = func(str string, args ...any) {
-				if !*quiet {
-					fmt.Fprintf(i.Stderr, str+"\n", args...)
-				}
-			}
-
-			return next(i)
-		}
-	}
-}
-
-func initAuth(authFlag *string, ca *overlay.ClientAuth) serpent.MiddlewareFunc {
-	return func(next serpent.HandlerFunc) serpent.HandlerFunc {
-		return func(i *serpent.Invocation) error {
-			if *authFlag == "" {
-				err := huh.NewInput().
-					Title("Enter your Auth ID:").
-					Value(authFlag).
-					Run()
-				if err != nil {
-					return fmt.Errorf("get auth id: %w", err)
-				}
-			}
-
-			// If the user provided a URL, extract the auth key from the fragment.
-			authKey := *authFlag
-			if u, err := url.Parse(*authFlag); err == nil && u.Fragment != "" {
-				authKey = u.Fragment
-			}
-
-			err := ca.Parse(strings.TrimSpace(authKey))
-			if err != nil {
-				return fmt.Errorf("parse auth key: %w", err)
-			}
-
-			return next(i)
-		}
-	}
-}
-
-func sendOverlayMW(opts *sendOverlayOpts, send **overlay.Send, logger *slog.Logger, dm *tailcfg.DERPMap, logf *func(str string, args ...any)) serpent.MiddlewareFunc {
-	return func(next serpent.HandlerFunc) serpent.HandlerFunc {
-		return func(i *serpent.Invocation) error {
-			if regionID := opts.clientAuth.ReceiverDERPRegionID; regionID != 0 && dm.Regions[int(regionID)] == nil {
-				return fmt.Errorf("auth key references unknown DERP region %d", regionID)
-			}
-
-			newSend := overlay.NewSendOverlay(logger, dm)
-			newSend.Auth = opts.clientAuth
-
-			newSend.Auth.PrintDebug(*logf, dm)
-
-			*send = newSend
-			defer newSend.Close()
-			return next(i)
-		}
-	}
-}
-
-func derpMap(fi *string, dm *tailcfg.DERPMap) serpent.MiddlewareFunc {
-	return func(next serpent.HandlerFunc) serpent.HandlerFunc {
-		return func(i *serpent.Invocation) error {
-			if *fi == "" {
-				_dm, err := tsserver.DERPMapTailscale(i.Context())
-				if err != nil {
-					return fmt.Errorf("request derpmap from tailscale: %w", err)
-				}
-				*dm = *_dm
-			} else {
-				data, err := os.ReadFile(*fi)
-				if err != nil {
-					return fmt.Errorf("read derp config file: %w", err)
-				}
-				if err := json.Unmarshal(data, dm); err != nil {
-					return fmt.Errorf("unmarshal derp config: %w", err)
-				}
-			}
-
-			return next(i)
-		}
-	}
-}
-
-type sendOverlayOpts struct {
-	authKey    string
-	clientAuth overlay.ClientAuth
-	waitP2P    bool
+type clientCLIOptions struct {
+	authKey string
+	waitP2P bool
 }
 
 const waitDirectDescription = "Waits until a direct connection is established instead of continuing over a relay."
@@ -130,9 +33,8 @@ func cpCmd() *serpent.Command {
 		logger    = new(slog.Logger)
 		logf      = func(str string, args ...any) {}
 
-		dm          = new(tailcfg.DERPMap)
-		overlayOpts = new(sendOverlayOpts)
-		send        = new(overlay.Send)
+		dm         *tailcfg.DERPMap
+		clientOpts = new(clientCLIOptions)
 	)
 	return &serpent.Command{
 		Use:   "cp <file>",
@@ -146,9 +48,8 @@ func cpCmd() *serpent.Command {
 		Middleware: serpent.Chain(
 			serpent.RequireNArgs(1),
 			initLogger(&verbose, ptr.To(false), logger, &logf),
-			initAuth(&overlayOpts.authKey, &overlayOpts.clientAuth),
-			derpMap(&derpmapFi, dm),
-			sendOverlayMW(overlayOpts, &send, logger, dm, &logf),
+			initAuth(&clientOpts.authKey),
+			derpMap(&derpmapFi, &dm),
 		),
 		Handler: func(inv *serpent.Invocation) error {
 			ctx := inv.Context()
@@ -169,48 +70,14 @@ func cpCmd() *serpent.Command {
 				return fmt.Errorf("upload path %q is not a regular file", fiPath)
 			}
 
-			s, err := tsserver.NewServer(ctx, logger, send, dm)
+			client, err := connectTransport(ctx, clientTransportOptions{
+				authKey: clientOpts.authKey, waitP2P: clientOpts.waitP2P,
+				derpMap: dm, verbose: verbose, logger: logger, logf: logf, logWriter: inv.Stderr,
+			})
 			if err != nil {
 				return err
 			}
-			defer s.Close()
-
-			go send.ListenOverlayDERP(ctx)
-
-			go func() {
-				if err := s.ListenAndServe(ctx); err != nil {
-					logger.Error("local control server stopped", "err", err)
-				}
-			}()
-
-			ts, err := newTSNet("send", verbose, s.ControlURL())
-			if err != nil {
-				return err
-			}
-			defer ts.Close()
-
-			logf("Bringing WireGuard up..")
-			if _, err := ts.Up(ctx); err != nil {
-				return fmt.Errorf("bring wireguard up: %w", err)
-			}
-			logf("WireGuard is ready!")
-
-			lc, err := ts.LocalClient()
-			if err != nil {
-				return err
-			}
-
-			ip, err := waitUntilHasPeerHasIP(ctx, logf, lc)
-			if err != nil {
-				return err
-			}
-
-			if overlayOpts.waitP2P {
-				err := waitUntilHasP2P(ctx, logf, lc)
-				if err != nil {
-					return err
-				}
-			}
+			defer client.Close()
 
 			bar := progressbar.DefaultBytes(
 				fiStat.Size(),
@@ -219,8 +86,8 @@ func cpCmd() *serpent.Command {
 			defer bar.Close()
 			barReader := progressbar.NewReader(fi, bar)
 
-			hc := ts.HTTPClient()
-			req, err := http.NewRequestWithContext(ctx, http.MethodPost, fileUploadURL(ip, fiName), &barReader)
+			hc := client.HTTPClient()
+			req, err := http.NewRequestWithContext(ctx, http.MethodPost, fileUploadURL(client.Route().IP, fiName), &barReader)
 			if err != nil {
 				return err
 			}
@@ -248,7 +115,7 @@ func cpCmd() *serpent.Command {
 				Env:         "WUSH_AUTH_KEY",
 				Description: "The auth key returned by " + cliui.Code("wush serve") + ". If not provided, it will be asked for on startup.",
 				Default:     "",
-				Value:       serpent.StringOf(&overlayOpts.authKey),
+				Value:       serpent.StringOf(&clientOpts.authKey),
 			},
 			{
 				Flag:        "derp-config-file",
@@ -260,7 +127,7 @@ func cpCmd() *serpent.Command {
 				Flag:        "wait-p2p",
 				Description: waitDirectDescription,
 				Default:     "false",
-				Value:       serpent.BoolOf(&overlayOpts.waitP2P),
+				Value:       serpent.BoolOf(&clientOpts.waitP2P),
 			},
 			{
 				Flag:          "verbose",

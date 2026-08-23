@@ -15,36 +15,55 @@ import (
 	"testing"
 	"time"
 
+	transportcore "github.com/coder/wush/internal/transport"
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
 )
 
-func TestConnectTargetPort(t *testing.T) {
+func TestTCPStdioPort(t *testing.T) {
 	t.Parallel()
 
 	for _, tc := range []struct {
-		target  string
+		input   string
 		want    uint16
 		wantErr bool
 	}{
-		{target: "127.0.0.1:22", want: 22},
-		{target: "localhost:2222", want: 2222},
-		{target: "[::1]:65535", want: 65535},
-		{target: "192.0.2.1:22", wantErr: true},
-		{target: "127.0.0.1:0", wantErr: true},
-		{target: "127.0.0.1", wantErr: true},
+		{input: "22", want: 22},
+		{input: "2222", want: 2222},
+		{input: "65535", want: 65535},
+		{input: "0", wantErr: true},
+		{input: "65536", wantErr: true},
+		{input: "localhost:22", wantErr: true},
 	} {
-		t.Run(tc.target, func(t *testing.T) {
+		t.Run(tc.input, func(t *testing.T) {
 			t.Parallel()
-			got, err := connectTargetPort(tc.target)
+			got, err := parsePort(tc.input)
 			if (err != nil) != tc.wantErr {
-				t.Fatalf("connectTargetPort(%q) error = %v, wantErr %v", tc.target, err, tc.wantErr)
+				t.Fatalf("parsePort(%q) error = %v, wantErr %v", tc.input, err, tc.wantErr)
 			}
 			if got != tc.want {
-				t.Fatalf("connectTargetPort(%q) = %d, want %d", tc.target, got, tc.want)
+				t.Fatalf("parsePort(%q) = %d, want %d", tc.input, got, tc.want)
 			}
 		})
+	}
+}
+
+func TestForwardCommandExposesTCPUDPAndStdio(t *testing.T) {
+	t.Parallel()
+
+	cmd := forwardCmd()
+	if cmd.Use != "forward" {
+		t.Fatalf("command use = %q, want forward", cmd.Use)
+	}
+	flags := make(map[string]bool)
+	for _, option := range cmd.Options {
+		flags[option.Flag] = true
+	}
+	for _, want := range []string{"tcp", "udp", "tcp-stdio"} {
+		if !flags[want] {
+			t.Fatalf("forward command is missing --%s", want)
+		}
 	}
 }
 
@@ -168,13 +187,13 @@ func TestServeConnectionHelp(t *testing.T) {
 WUSH_AUTH_KEY=test-auth-key wush shell
 
 Connect with system OpenSSH:
-WUSH_AUTH_KEY=test-auth-key ssh -o 'ProxyCommand=wush connect --stdio --quiet 127.0.0.1:%p' alice@wush
+WUSH_AUTH_KEY=test-auth-key ssh -o 'ProxyCommand=wush forward --tcp-stdio %p --quiet' alice@wush
 
 Or add this block to ~/.ssh/config:
 Host wush
   HostName wush
   User alice
-  ProxyCommand env WUSH_AUTH_KEY=test-auth-key wush connect --stdio --quiet 127.0.0.1:%p
+  ProxyCommand env WUSH_AUTH_KEY=test-auth-key wush forward --tcp-stdio %p --quiet
 `
 	if got != want {
 		t.Fatalf("connection help:\n%s\nwant:\n%s", got, want)
@@ -304,36 +323,10 @@ func TestPeerConnectionLog(t *testing.T) {
 	}
 }
 
-func TestWaitUntilHasPeerHasIPAndPathReportsRelay(t *testing.T) {
-	t.Parallel()
-
-	peerIP := netip.MustParseAddr("fd7a:115c:a1e0::2")
-	client := &fakePeerStatusClient{status: peerStatus(peerIP, "lax", "")}
-	var logs []string
-	logf := func(format string, args ...any) {
-		logs = append(logs, fmt.Sprintf(format, args...))
-	}
-
-	gotIP, relay, direct, err := waitUntilHasPeerHasIPAndPath(context.Background(), logf, client)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if gotIP != peerIP || relay != "lax" || direct {
-		t.Fatalf("peer path = (%s, %q, %v), want (%s, %q, false)", gotIP, relay, direct, peerIP, "lax")
-	}
-	if got := strings.Join(logs, "\n"); !strings.Contains(got, "Peer reachable via relay") || !strings.Contains(got, "lax") {
-		t.Fatalf("logs = %q, want relay status", got)
-	}
-}
-
 func TestNegotiateShellDirectConnection(t *testing.T) {
 	t.Parallel()
 
-	peerIP := netip.MustParseAddr("fd7a:115c:a1e0::2")
-	client := &fakePeerStatusClient{
-		status: peerStatus(peerIP, "lax", ""),
-		ping:   &ipnstate.PingResult{Endpoint: "192.0.2.1:41641"},
-	}
+	client := &fakeDirectWaiter{}
 	var logs []string
 	logf := func(format string, args ...any) {
 		logs = append(logs, fmt.Sprintf(format, args...))
@@ -351,11 +344,7 @@ func TestNegotiateShellDirectConnection(t *testing.T) {
 func TestNegotiateShellDirectConnectionFallsBackToRelay(t *testing.T) {
 	t.Parallel()
 
-	peerIP := netip.MustParseAddr("fd7a:115c:a1e0::2")
-	client := &fakePeerStatusClient{
-		status:  peerStatus(peerIP, "lax", ""),
-		pingErr: context.DeadlineExceeded,
-	}
+	client := &fakeDirectWaiter{wait: true}
 	var logs []string
 	logf := func(format string, args ...any) {
 		logs = append(logs, fmt.Sprintf(format, args...))
@@ -370,30 +359,16 @@ func TestNegotiateShellDirectConnectionFallsBackToRelay(t *testing.T) {
 	}
 }
 
-type fakePeerStatusClient struct {
-	status  *ipnstate.Status
-	ping    *ipnstate.PingResult
-	pingErr error
+type fakeDirectWaiter struct {
+	wait bool
 }
 
-func (client *fakePeerStatusClient) Status(context.Context) (*ipnstate.Status, error) {
-	return client.status, nil
-}
-
-func (client *fakePeerStatusClient) Ping(context.Context, netip.Addr, tailcfg.PingType) (*ipnstate.PingResult, error) {
-	return client.ping, client.pingErr
-}
-
-func peerStatus(peerIP netip.Addr, relay, directEndpoint string) *ipnstate.Status {
-	nodeKey := key.NewNode().Public()
-	return &ipnstate.Status{Peer: map[key.NodePublic]*ipnstate.PeerStatus{
-		nodeKey: {
-			TailscaleIPs: []netip.Addr{peerIP},
-			Relay:        relay,
-			CurAddr:      directEndpoint,
-			Active:       true,
-		},
-	}}
+func (client *fakeDirectWaiter) WaitDirect(ctx context.Context, _ transportcore.Logf) error {
+	if !client.wait {
+		return nil
+	}
+	<-ctx.Done()
+	return ctx.Err()
 }
 
 func TestBicopyCancellationClosesConnections(t *testing.T) {
@@ -417,6 +392,82 @@ func TestBicopyCancellationClosesConnections(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("bicopy did not exit after cancellation")
 	}
+}
+
+func TestBicopyPreservesResponseAfterHalfClose(t *testing.T) {
+	t.Parallel()
+
+	client, proxyLeft := newHalfPipe()
+	proxyRight, backend := newHalfPipe()
+	done := make(chan struct{})
+	go func() {
+		bicopy(context.Background(), proxyLeft, proxyRight)
+		close(done)
+	}()
+
+	type readResult struct {
+		data []byte
+		err  error
+	}
+	requestResult := make(chan readResult, 1)
+	go func() {
+		data, err := io.ReadAll(backend)
+		requestResult <- readResult{data: data, err: err}
+	}()
+	if _, err := io.WriteString(client, "request"); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.CloseWrite(); err != nil {
+		t.Fatal(err)
+	}
+	request := <-requestResult
+	if request.err != nil {
+		t.Fatal(request.err)
+	}
+	if string(request.data) != "request" {
+		t.Fatalf("request = %q", request.data)
+	}
+	responseResult := make(chan readResult, 1)
+	go func() {
+		data, err := io.ReadAll(client)
+		responseResult <- readResult{data: data, err: err}
+	}()
+	if _, err := io.WriteString(backend, "response"); err != nil {
+		t.Fatal(err)
+	}
+	if err := backend.CloseWrite(); err != nil {
+		t.Fatal(err)
+	}
+	response := <-responseResult
+	if response.err != nil {
+		t.Fatal(response.err)
+	}
+	if string(response.data) != "response" {
+		t.Fatalf("response = %q", response.data)
+	}
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("bicopy did not finish after both half-closes")
+	}
+}
+
+type halfPipe struct {
+	reader *io.PipeReader
+	writer *io.PipeWriter
+}
+
+func newHalfPipe() (*halfPipe, *halfPipe) {
+	leftReader, rightWriter := io.Pipe()
+	rightReader, leftWriter := io.Pipe()
+	return &halfPipe{reader: leftReader, writer: leftWriter}, &halfPipe{reader: rightReader, writer: rightWriter}
+}
+
+func (p *halfPipe) Read(buf []byte) (int, error)  { return p.reader.Read(buf) }
+func (p *halfPipe) Write(buf []byte) (int, error) { return p.writer.Write(buf) }
+func (p *halfPipe) CloseWrite() error             { return p.writer.Close() }
+func (p *halfPipe) Close() error {
+	return errors.Join(p.reader.Close(), p.writer.Close())
 }
 
 func TestParsePortRangeIncludesMaximumPort(t *testing.T) {

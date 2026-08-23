@@ -21,16 +21,13 @@ import (
 	"golang.org/x/term"
 	"tailscale.com/client/tailscale"
 	"tailscale.com/ipn/ipnstate"
-	"tailscale.com/ipn/store"
 	"tailscale.com/tailcfg"
-	"tailscale.com/tsnet"
 	"tailscale.com/types/key"
 
 	"github.com/coder/pretty"
 	"github.com/coder/serpent"
 	"github.com/coder/wush/cliui"
-	"github.com/coder/wush/overlay"
-	"github.com/coder/wush/tsserver"
+	transportcore "github.com/coder/wush/internal/transport"
 	"github.com/coder/wush/xssh"
 )
 
@@ -41,13 +38,13 @@ func serveCmd() *serpent.Command {
 		disabled  = []string{}
 		derpmapFi string
 
-		dm = new(tailcfg.DERPMap)
+		dm *tailcfg.DERPMap
 	)
 	return &serpent.Command{
 		Use:   "serve",
 		Short: "Run the wush server. Allow wush clients to connect.",
 		Middleware: serpent.Chain(
-			derpMap(&derpmapFi, dm),
+			derpMap(&derpmapFi, &dm),
 		),
 		Handler: func(inv *serpent.Invocation) error {
 			ctx, ctxCancel := inv.SignalNotifyContext(inv.Context(), os.Interrupt)
@@ -61,50 +58,47 @@ func serveCmd() *serpent.Command {
 				logSink = inv.Stderr
 			}
 			logger := slog.New(slog.NewTextHandler(logSink, nil))
-			r := overlay.NewReceiveOverlay(logger, humanLog.info, dm)
+			shellEnabled := slices.Contains(enabled, "shell") && !slices.Contains(disabled, "shell")
+			forwardEnabled := slices.Contains(enabled, "forward") && !slices.Contains(disabled, "forward")
 
-			if err := r.PickDERPHome(ctx); err != nil {
+			var udpHandler transportcore.UDPHandler
+			if forwardEnabled {
+				udpHandler = func(ctx context.Context, src net.Conn, port uint16) {
+					dst, err := net.Dial("udp", fmt.Sprintf("127.0.0.1:%d", port))
+					if err != nil {
+						humanLog.error("Failed to dial forwarded UDP connection: %s", err)
+						_ = src.Close()
+						return
+					}
+					copyDatagrams(ctx, src, dst)
+				}
+			}
+
+			host, err := transportcore.StartHost(ctx, transportcore.HostOptions{
+				CommonOptions: transportcore.CommonOptions{
+					DERPMap: dm, Logger: logger, Logf: humanLog.info,
+					Verbose: verbose, LogWriter: inv.Stderr,
+				},
+				UDPHandler: udpHandler,
+			})
+			if err != nil {
 				return err
 			}
-			go r.ListenOverlayDERP(ctx)
+			defer host.Close()
 
-			authKey := r.ClientAuth().AuthKey()
-			shellEnabled := slices.Contains(enabled, "shell") && !slices.Contains(disabled, "shell")
-			portForwardEnabled := slices.Contains(enabled, "port-forward") && !slices.Contains(disabled, "port-forward")
+			authKey := host.AuthKey()
 
 			// Ensure we always print the auth key on stdout.
 			if term.IsTerminal(int(os.Stdout.Fd())) {
 				plainf("\n%s", cliui.Bold("Your auth key is:"))
 				fmt.Println("  >", cliui.Code(authKey))
 				plainf("Use this key to authenticate other wush commands to this instance.")
-				if shellEnabled || portForwardEnabled {
-					plainf("\n%s", serveConnectionHelp(authKey, serveUsername(), shellEnabled, portForwardEnabled))
+				if shellEnabled || forwardEnabled {
+					plainf("\n%s", serveConnectionHelp(authKey, serveUsername(), shellEnabled, forwardEnabled))
 				}
 			} else {
 				fmt.Println(cliui.Code(authKey))
 				humanLog.info("The auth key has been printed to stdout")
-			}
-
-			s, err := tsserver.NewServer(ctx, logger, r, dm)
-			if err != nil {
-				return err
-			}
-			defer s.Close()
-
-			go func() {
-				if err := s.ListenAndServe(ctx); err != nil && ctx.Err() == nil {
-					humanLog.error("Local control server exited: %s", err)
-				}
-			}()
-			ts, err := newTSNet("receive", verbose, s.ControlURL())
-			if err != nil {
-				return err
-			}
-			defer ts.Close()
-
-			_, err = ts.Up(ctx)
-			if err != nil {
-				return fmt.Errorf("bring wireguard up: %w", err)
 			}
 
 			closers := []io.Closer{}
@@ -116,7 +110,7 @@ func serveCmd() *serpent.Command {
 				}
 				closers = append(closers, sshSrv)
 
-				sshListener, err := ts.Listen("tcp", ":3")
+				sshListener, err := host.Listen("tcp", ":3")
 				if err != nil {
 					return err
 				}
@@ -133,7 +127,7 @@ func serveCmd() *serpent.Command {
 			}
 
 			if slices.Contains(enabled, "cp") && !slices.Contains(disabled, "cp") {
-				cpListener, err := ts.Listen("tcp", ":4444")
+				cpListener, err := host.Listen("tcp", ":4444")
 				if err != nil {
 					return err
 				}
@@ -149,8 +143,8 @@ func serveCmd() *serpent.Command {
 				humanLog.warn("File transfer server %s", pretty.Sprint(cliui.DefaultStyles.Disabled, "disabled"))
 			}
 
-			if portForwardEnabled {
-				ts.RegisterFallbackTCPHandler(func(src, dst netip.AddrPort) (handler func(net.Conn), intercept bool) {
+			if forwardEnabled {
+				host.RegisterFallbackTCPHandler(func(src, dst netip.AddrPort) (handler func(net.Conn), intercept bool) {
 					return func(src net.Conn) {
 						dst, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", dst.Port()))
 						if err != nil {
@@ -163,16 +157,11 @@ func serveCmd() *serpent.Command {
 					}, true
 				})
 			} else {
-				humanLog.warn("Port-forward server %s", pretty.Sprint(cliui.DefaultStyles.Disabled, "disabled"))
+				humanLog.warn("Forward server %s", pretty.Sprint(cliui.DefaultStyles.Disabled, "disabled"))
 			}
 
-			lc, err := ts.LocalClient()
-			if err != nil {
-				return fmt.Errorf("get local client: %w", err)
-			}
-			go monitorPeerConnections(ctx, lc, dm, humanLog)
+			go monitorPeerConnections(ctx, host.LocalClient(), dm, humanLog)
 
-			closers = append(closers, ts)
 			<-ctx.Done()
 			for _, closer := range closers {
 				closer.Close()
@@ -190,14 +179,14 @@ func serveCmd() *serpent.Command {
 			{
 				Flag:        "enable",
 				Description: "Server options to enable.",
-				Default:     "shell,cp,port-forward",
-				Value:       serpent.EnumArrayOf(&enabled, "shell", "cp", "port-forward"),
+				Default:     "shell,cp,forward",
+				Value:       serpent.EnumArrayOf(&enabled, "shell", "cp", "forward"),
 			},
 			{
 				Flag:        "disable",
 				Description: "Server options to disable.",
 				Default:     "",
-				Value:       serpent.EnumArrayOf(&disabled, "shell", "cp", "port-forward"),
+				Value:       serpent.EnumArrayOf(&disabled, "shell", "cp", "forward"),
 			},
 			{
 				Flag:        "derp-config-file",
@@ -359,23 +348,23 @@ func serveUsername() string {
 	return "user"
 }
 
-func serveConnectionHelp(authKey, username string, shellEnabled, openSSHEnabled bool) string {
+func serveConnectionHelp(authKey, username string, shellEnabled, forwardEnabled bool) string {
 	authAssignment := "WUSH_AUTH_KEY=" + authKey
 	sections := make([]string, 0, 3)
 	if shellEnabled {
 		sections = append(sections, fmt.Sprintf("%s\n%s wush shell",
 			cliui.Bold("Open a zero-configuration shell:"), authAssignment))
 	}
-	if !openSSHEnabled {
+	if !forwardEnabled {
 		if len(sections) == 0 {
 			return ""
 		}
 		return strings.Join(sections, "\n\n") + "\n"
 	}
 
-	proxyOption := "'ProxyCommand=wush connect --stdio --quiet 127.0.0.1:%p'"
+	proxyOption := "'ProxyCommand=wush forward --tcp-stdio %p --quiet'"
 	command := fmt.Sprintf("%s ssh -o %s %s@wush", authAssignment, proxyOption, username)
-	proxyCommand := fmt.Sprintf("env %s wush connect --stdio --quiet 127.0.0.1:%%p", authAssignment)
+	proxyCommand := fmt.Sprintf("env %s wush forward --tcp-stdio %%p --quiet", authAssignment)
 	sections = append(sections, fmt.Sprintf(`%s
 %s
 
@@ -394,33 +383,6 @@ func serveConnectionHelp(authKey, username string, shellEnabled, openSSHEnabled 
 	return strings.Join(sections, "\n\n") + "\n"
 }
 
-func newTSNet(direction string, verbose bool, controlURL string) (*tsnet.Server, error) {
-	var err error
-	tmp := os.TempDir()
-	srv := new(tsnet.Server)
-	srv.Dir = tmp
-	srv.Hostname = "wush-" + direction
-	srv.Ephemeral = true
-	srv.AuthKey = direction
-	srv.ControlURL = controlURL
-	srv.Logf = func(format string, args ...any) {}
-	srv.UserLogf = func(format string, args ...any) {}
-	if verbose {
-		logf := func(format string, args ...any) {
-			fmt.Fprintf(os.Stderr, format+"\n", args...)
-		}
-		srv.Logf = logf
-		srv.UserLogf = logf
-	}
-
-	srv.Store, err = store.New(func(format string, args ...any) {}, "mem:wush")
-	if err != nil {
-		return nil, fmt.Errorf("create state store: %w", err)
-	}
-
-	return srv, nil
-}
-
 func bicopy(ctx context.Context, c1, c2 io.ReadWriteCloser) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -432,13 +394,15 @@ func bicopy(ctx context.Context, c1, c2 io.ReadWriteCloser) {
 
 	var wg sync.WaitGroup
 	copyFunc := func(dst io.WriteCloser, src io.Reader) {
-		defer func() {
-			wg.Done()
-			// If one side of the copy fails, ensure the other one exits as
-			// well.
-			cancel()
-		}()
+		defer wg.Done()
 		_, _ = io.Copy(dst, src)
+		if closeWriter, ok := dst.(interface{ CloseWrite() error }); ok {
+			_ = closeWriter.CloseWrite()
+			return
+		}
+		// Streams without half-close support cannot preserve the opposite
+		// direction after EOF, so unblock it by closing the pair.
+		cancel()
 	}
 
 	wg.Add(2)

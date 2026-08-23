@@ -40,6 +40,11 @@ executable. The running process finishes normally; the new version is used on
 the next invocation. The executable's directory must be writable by the
 current user.
 
+The `serve`, `shell`, `cp`, and `forward` commands also perform this update as
+a best-effort check at most once every 24 hours. Update failures never block the
+requested command. Set `TSOK_NO_AUTO_UPDATE=1` to disable automatic updates;
+`tsok update` remains available for an explicit update.
+
 ## Quick start
 
 On the host machine:

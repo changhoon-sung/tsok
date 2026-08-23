@@ -44,10 +44,10 @@ func main() {
 			versionCmd(),
 			updateCmd(),
 			licensesCmd(),
-			shellCmd(),
-			serveCmd(),
-			cpCmd(),
-			forwardCmd(),
+			withAutoUpdate(shellCmd()),
+			withAutoUpdate(serveCmd()),
+			withAutoUpdate(cpCmd()),
+			withAutoUpdate(forwardCmd()),
 		},
 		Options: []serpent.Option{
 			{

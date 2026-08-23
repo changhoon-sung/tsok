@@ -6,9 +6,9 @@ import (
 	"io"
 	"log/slog"
 
+	transportcore "github.com/changhoon-sung/tsok/internal/transport"
 	"github.com/charmbracelet/huh"
 	"github.com/coder/serpent"
-	transportcore "github.com/coder/wush/internal/transport"
 	"tailscale.com/tailcfg"
 )
 

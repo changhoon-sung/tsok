@@ -7,31 +7,31 @@ import (
 	"strings"
 	"time"
 
+	"github.com/changhoon-sung/tsok/cliui"
 	"github.com/coder/pretty"
 	"github.com/coder/serpent"
-	"github.com/coder/wush/cliui"
 )
 
 func main() {
 	var (
 		showVersion bool
 
-		fmtLong = "wush %s - WireGuard-powered peer-to-peer file transfer and shell\n"
+		fmtLong = "tsok %s - temporary authenticated sockets over tsnet\n"
 	)
 	cmd := &serpent.Command{
-		Use: "wush <subcommand>",
+		Use: "tsok <subcommand>",
 		Long: fmt.Sprintf(fmtLong, getBuildInfo().version) + formatExamples(
 			example{
-				Description: "Start the wush server to accept incoming connections",
-				Command:     "wush serve",
+				Description: "Start the tsok server to accept incoming connections",
+				Command:     "tsok serve",
 			},
 			example{
-				Description: "Open a shell to a wush server",
-				Command:     "wush shell",
+				Description: "Open a shell to a tsok server",
+				Command:     "tsok shell",
 			},
 			example{
-				Description: "Copy a single file to a wush server",
-				Command:     "wush cp local-file.txt",
+				Description: "Copy a single file to a tsok server",
+				Command:     "tsok cp local-file.txt",
 			},
 		),
 		Handler: func(i *serpent.Invocation) error {

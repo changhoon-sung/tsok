@@ -28,11 +28,11 @@ func TestServerRunsCommands(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	output, err := session.CombinedOutput("printf 'wush-ssh'")
+	output, err := session.CombinedOutput("printf 'tsok-ssh'")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got, want := string(output), "wush-ssh"; got != want {
+	if got, want := string(output), "tsok-ssh"; got != want {
 		t.Fatalf("output = %q, want %q", got, want)
 	}
 }
@@ -61,7 +61,7 @@ func TestServerDoesNotWaitForOpenStdin(t *testing.T) {
 	}
 	done := make(chan commandResult, 1)
 	go func() {
-		output, err := session.CombinedOutput("printf 'wush-ssh'")
+		output, err := session.CombinedOutput("printf 'tsok-ssh'")
 		done <- commandResult{output: output, err: err}
 	}()
 
@@ -70,7 +70,7 @@ func TestServerDoesNotWaitForOpenStdin(t *testing.T) {
 		if result.err != nil {
 			t.Fatal(result.err)
 		}
-		if got, want := string(result.output), "wush-ssh"; got != want {
+		if got, want := string(result.output), "tsok-ssh"; got != want {
 			t.Fatalf("output = %q, want %q", got, want)
 		}
 	case <-time.After(2 * time.Second):
@@ -114,7 +114,7 @@ func TestServerRunsPTY(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := session.RequestPty("wush-test", 24, 80, ssh.TerminalModes{
+	if err := session.RequestPty("tsok-test", 24, 80, ssh.TerminalModes{
 		ssh.ECHO:          1,
 		ssh.TTY_OP_ISPEED: 14400,
 		ssh.TTY_OP_OSPEED: 14400,
@@ -150,7 +150,7 @@ func TestServerRunsPTY(t *testing.T) {
 	}
 
 	got := strings.ReplaceAll(string(rest), "\r", "")
-	for _, want := range []string{"term=wush-test tty=set", "size=40 100"} {
+	for _, want := range []string{"term=tsok-test tty=set", "size=40 100"} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("PTY output %q does not contain %q", got, want)
 		}
@@ -173,7 +173,7 @@ func TestServerDrainsPTYOutput(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := session.RequestPty("wush-test", 24, 80, ssh.TerminalModes{
+	if err := session.RequestPty("tsok-test", 24, 80, ssh.TerminalModes{
 		ssh.TTY_OP_ISPEED: 14400,
 		ssh.TTY_OP_OSPEED: 14400,
 	}); err != nil {
@@ -280,7 +280,7 @@ func (s *sshServer) Close() error {
 func dialTestServer(t *testing.T, address string) *ssh.Client {
 	t.Helper()
 	client, err := ssh.Dial("tcp", address, &ssh.ClientConfig{
-		User:            "wush-test",
+		User:            "tsok-test",
 		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
 		Timeout:         5 * time.Second,
 	})

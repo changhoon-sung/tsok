@@ -2,8 +2,8 @@
 
 set -eu
 
-GITHUB_REPO="changhoon-sung/wush"
-BINARY_NAME="wush"
+GITHUB_REPO="changhoon-sung/tsok"
+BINARY_NAME="tsok"
 INSTALL_DIR="/usr/local/bin"
 
 # Function to determine the platform

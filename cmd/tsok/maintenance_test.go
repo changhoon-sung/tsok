@@ -15,7 +15,7 @@ import (
 	"testing"
 	"time"
 
-	transportcore "github.com/coder/wush/internal/transport"
+	transportcore "github.com/changhoon-sung/tsok/internal/transport"
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
@@ -184,16 +184,16 @@ func TestServeConnectionHelp(t *testing.T) {
 
 	got := serveConnectionHelp("test-auth-key", "alice", true, true)
 	want := `Open a zero-configuration shell:
-WUSH_AUTH_KEY=test-auth-key wush shell
+TSOK_AUTH_KEY=test-auth-key tsok shell
 
 Connect with system OpenSSH:
-WUSH_AUTH_KEY=test-auth-key ssh -o 'ProxyCommand=wush forward --tcp-stdio %p --quiet' alice@wush
+TSOK_AUTH_KEY=test-auth-key ssh -o 'ProxyCommand=tsok forward --tcp-stdio %p --quiet' alice@tsok
 
 Or add this block to ~/.ssh/config:
-Host wush
-  HostName wush
+Host tsok
+  HostName tsok
   User alice
-  ProxyCommand env WUSH_AUTH_KEY=test-auth-key wush forward --tcp-stdio %p --quiet
+  ProxyCommand env TSOK_AUTH_KEY=test-auth-key tsok forward --tcp-stdio %p --quiet
 `
 	if got != want {
 		t.Fatalf("connection help:\n%s\nwant:\n%s", got, want)
@@ -206,11 +206,11 @@ Host wush
 	}
 
 	shellOnly := serveConnectionHelp("test-auth-key", "alice", true, false)
-	if want := "Open a zero-configuration shell:\nWUSH_AUTH_KEY=test-auth-key wush shell\n"; shellOnly != want {
+	if want := "Open a zero-configuration shell:\nTSOK_AUTH_KEY=test-auth-key tsok shell\n"; shellOnly != want {
 		t.Fatalf("shell-only help = %q, want %q", shellOnly, want)
 	}
 	openSSHOnly := serveConnectionHelp("test-auth-key", "alice", false, true)
-	if strings.Contains(openSSHOnly, "wush shell") || !strings.Contains(openSSHOnly, "Connect with system OpenSSH:") {
+	if strings.Contains(openSSHOnly, "tsok shell") || !strings.Contains(openSSHOnly, "Connect with system OpenSSH:") {
 		t.Fatalf("OpenSSH-only help contains unexpected routes: %q", openSSHOnly)
 	}
 	if got := serveConnectionHelp("test-auth-key", "alice", false, false); got != "" {
@@ -222,10 +222,10 @@ func TestLicenseReportURL(t *testing.T) {
 	t.Parallel()
 
 	const commitHash = "0123456789abcdef0123456789abcdef01234567"
-	if got, want := licenseReportURL(commitHash), "https://github.com/changhoon-sung/wush/blob/"+commitHash+"/licenses/wush.md"; got != want {
+	if got, want := licenseReportURL(commitHash), "https://github.com/changhoon-sung/tsok/blob/"+commitHash+"/licenses/tsok.md"; got != want {
 		t.Fatalf("license report URL = %q, want %q", got, want)
 	}
-	if got, want := licenseReportURL(strings.Repeat("0", 40)), "https://github.com/changhoon-sung/wush/blob/main/licenses/wush.md"; got != want {
+	if got, want := licenseReportURL(strings.Repeat("0", 40)), "https://github.com/changhoon-sung/tsok/blob/main/licenses/tsok.md"; got != want {
 		t.Fatalf("development license report URL = %q, want %q", got, want)
 	}
 }

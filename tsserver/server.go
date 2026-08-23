@@ -38,7 +38,7 @@ import (
 	"tailscale.com/types/opt"
 	"tailscale.com/types/ptr"
 
-	"github.com/coder/wush/overlay"
+	"github.com/changhoon-sung/tsok/overlay"
 )
 
 func DERPMapTailscale(ctx context.Context) (*tailcfg.DERPMap, error) {
@@ -745,7 +745,7 @@ func applyPeerChange(node *tailcfg.Node, change tailcfg.PeerChange) {
 		}
 		node.HomeDERP = change.DERPRegion
 		// Older Tailscale clients only understand the legacy DERP-in-IP:port
-		// field. Emit both representations while mixed wush versions are
+		// field. Emit both representations while mixed protocol versions are
 		// supported.
 		node.LegacyDERPString = net.JoinHostPort(tailcfg.DerpMagicIP, strconv.Itoa(change.DERPRegion))
 	}

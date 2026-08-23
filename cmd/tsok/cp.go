@@ -12,8 +12,8 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/changhoon-sung/tsok/cliui"
 	"github.com/coder/serpent"
-	"github.com/coder/wush/cliui"
 	"github.com/schollz/progressbar/v3"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/ptr"
@@ -38,11 +38,11 @@ func cpCmd() *serpent.Command {
 	)
 	return &serpent.Command{
 		Use:   "cp <file>",
-		Short: "Transfer files to a wush server.",
+		Short: "Transfer files to a tsok server.",
 		Long: formatExamples(
 			example{
 				Description: "Copy a local file to the server",
-				Command:     "wush cp local-file.txt",
+				Command:     "tsok cp local-file.txt",
 			},
 		),
 		Middleware: serpent.Chain(
@@ -112,8 +112,8 @@ func cpCmd() *serpent.Command {
 		Options: []serpent.Option{
 			{
 				Flag:        "auth-key",
-				Env:         "WUSH_AUTH_KEY",
-				Description: "The auth key returned by " + cliui.Code("wush serve") + ". If not provided, it will be asked for on startup.",
+				Env:         "TSOK_AUTH_KEY",
+				Description: "The auth key returned by " + cliui.Code("tsok serve") + ". If not provided, it will be asked for on startup.",
 				Default:     "",
 				Value:       serpent.StringOf(&clientOpts.authKey),
 			},

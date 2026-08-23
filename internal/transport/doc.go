@@ -1,4 +1,4 @@
-// Package transport owns the shared wush network lifecycle.
+// Package transport owns the shared tsok network lifecycle.
 //
 // It composes the encrypted DERP control overlay, the in-memory control server,
 // and an ephemeral tsnet node into client and host transports. CLI commands

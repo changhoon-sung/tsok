@@ -24,11 +24,11 @@ import (
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
 
+	"github.com/changhoon-sung/tsok/cliui"
+	transportcore "github.com/changhoon-sung/tsok/internal/transport"
+	"github.com/changhoon-sung/tsok/xssh"
 	"github.com/coder/pretty"
 	"github.com/coder/serpent"
-	"github.com/coder/wush/cliui"
-	transportcore "github.com/coder/wush/internal/transport"
-	"github.com/coder/wush/xssh"
 )
 
 func serveCmd() *serpent.Command {
@@ -42,7 +42,7 @@ func serveCmd() *serpent.Command {
 	)
 	return &serpent.Command{
 		Use:   "serve",
-		Short: "Run the wush server. Allow wush clients to connect.",
+		Short: "Run the tsok server. Allow tsok clients to connect.",
 		Middleware: serpent.Chain(
 			derpMap(&derpmapFi, &dm),
 		),
@@ -92,7 +92,7 @@ func serveCmd() *serpent.Command {
 			if term.IsTerminal(int(os.Stdout.Fd())) {
 				plainf("\n%s", cliui.Bold("Your auth key is:"))
 				fmt.Println("  >", cliui.Code(authKey))
-				plainf("Use this key to authenticate other wush commands to this instance.")
+				plainf("Use this key to authenticate other tsok commands to this instance.")
 				if shellEnabled || forwardEnabled {
 					plainf("\n%s", serveConnectionHelp(authKey, serveUsername(), shellEnabled, forwardEnabled))
 				}
@@ -349,10 +349,10 @@ func serveUsername() string {
 }
 
 func serveConnectionHelp(authKey, username string, shellEnabled, forwardEnabled bool) string {
-	authAssignment := "WUSH_AUTH_KEY=" + authKey
+	authAssignment := "TSOK_AUTH_KEY=" + authKey
 	sections := make([]string, 0, 3)
 	if shellEnabled {
-		sections = append(sections, fmt.Sprintf("%s\n%s wush shell",
+		sections = append(sections, fmt.Sprintf("%s\n%s tsok shell",
 			cliui.Bold("Open a zero-configuration shell:"), authAssignment))
 	}
 	if !forwardEnabled {
@@ -362,21 +362,21 @@ func serveConnectionHelp(authKey, username string, shellEnabled, forwardEnabled 
 		return strings.Join(sections, "\n\n") + "\n"
 	}
 
-	proxyOption := "'ProxyCommand=wush forward --tcp-stdio %p --quiet'"
-	command := fmt.Sprintf("%s ssh -o %s %s@wush", authAssignment, proxyOption, username)
-	proxyCommand := fmt.Sprintf("env %s wush forward --tcp-stdio %%p --quiet", authAssignment)
+	proxyOption := "'ProxyCommand=tsok forward --tcp-stdio %p --quiet'"
+	command := fmt.Sprintf("%s ssh -o %s %s@tsok", authAssignment, proxyOption, username)
+	proxyCommand := fmt.Sprintf("env %s tsok forward --tcp-stdio %%p --quiet", authAssignment)
 	sections = append(sections, fmt.Sprintf(`%s
 %s
 
 %s
 %s
-  HostName wush
+  HostName tsok
   User %s
   %s %s`,
 		cliui.Bold("Connect with system OpenSSH:"),
 		command,
 		cliui.Bold("Or add this block to ~/.ssh/config:"),
-		cliui.Bold("Host wush"),
+		cliui.Bold("Host tsok"),
 		username,
 		"ProxyCommand", proxyCommand,
 	))

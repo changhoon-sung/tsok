@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/coder/wush/overlay"
+	"github.com/changhoon-sung/tsok/overlay"
 	"tailscale.com/client/tailscale"
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/ipn/store"
@@ -144,14 +144,14 @@ func TestUpstreamTSNetHandshake(t *testing.T) {
 func startIntegrationTSNet(t *testing.T, s *server, name string) (*tsnet.Server, *tailscale.LocalClient) {
 	t.Helper()
 	logf := func(string, ...any) {}
-	state, err := store.New(logf, "mem:wush-upstream-integration-"+name)
+	state, err := store.New(logf, "mem:tsok-upstream-integration-"+name)
 	if err != nil {
 		t.Fatal(err)
 	}
 	ts := &tsnet.Server{
 		Dir:        t.TempDir(),
 		Store:      state,
-		Hostname:   "wush-upstream-integration-" + name,
+		Hostname:   "tsok-upstream-integration-" + name,
 		Ephemeral:  true,
 		AuthKey:    "integration-test-" + name,
 		ControlURL: s.ControlURL(),

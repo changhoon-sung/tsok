@@ -1,4 +1,4 @@
-module github.com/coder/wush
+module github.com/changhoon-sung/tsok
 
 go 1.27.0
 

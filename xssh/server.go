@@ -19,7 +19,7 @@ import (
 )
 
 // NewServer returns an SSH server that runs commands as the current user.
-// Authentication is provided by the encrypted wush overlay, so the SSH layer
+// Authentication is provided by the encrypted tsok overlay, so the SSH layer
 // intentionally does not add a second authentication mechanism.
 func NewServer() (*ssh.Server, error) {
 	server := &ssh.Server{
@@ -62,7 +62,7 @@ func singleSessionHandler(server *ssh.Server, conn *gossh.ServerConn, newChannel
 	ctx.Unlock()
 
 	if used {
-		_ = newChannel.Reject(gossh.ResourceShortage, "wush allows one session per SSH connection")
+		_ = newChannel.Reject(gossh.ResourceShortage, "tsok allows one session per SSH connection")
 		return
 	}
 

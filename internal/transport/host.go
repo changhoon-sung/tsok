@@ -11,8 +11,8 @@ import (
 	"tailscale.com/client/tailscale"
 	"tailscale.com/tsnet"
 
-	"github.com/coder/wush/overlay"
-	"github.com/coder/wush/tsserver"
+	"github.com/changhoon-sung/tsok/overlay"
+	"github.com/changhoon-sung/tsok/tsserver"
 )
 
 type UDPHandler func(ctx context.Context, conn net.Conn, port uint16)

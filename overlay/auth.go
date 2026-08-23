@@ -8,7 +8,7 @@ import (
 	"io"
 
 	"github.com/btcsuite/btcd/btcutil/base58"
-	"github.com/coder/wush/cliui"
+	"github.com/changhoon-sung/tsok/cliui"
 	"go4.org/mem"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"

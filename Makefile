@@ -3,7 +3,7 @@ SHELL := /bin/sh
 GO ?= go
 DIST_DIR ?= dist
 VERSION ?= dev
-PACKAGE := ./cmd/wush
+PACKAGE := ./cmd/tsok
 
 COMMIT ?= $(shell git rev-parse HEAD)
 COMMIT_DATE ?= $(shell git show -s --format=%ct HEAD)
@@ -17,27 +17,27 @@ LDFLAGS := -X main.version=$(VERSION) -X main.commit=$(COMMIT) -X main.commitDat
 
 build:
 	@mkdir -p "$(DIST_DIR)"
-	$(GO) build -trimpath -ldflags "$(LDFLAGS)" -o "$(DIST_DIR)/wush_$(HOST_GOOS)_$(HOST_GOARCH)" $(PACKAGE)
+	$(GO) build -trimpath -ldflags "$(LDFLAGS)" -o "$(DIST_DIR)/tsok_$(HOST_GOOS)_$(HOST_GOARCH)" $(PACKAGE)
 
 linux: linux-amd64 linux-arm64
 
 linux-amd64:
 	@mkdir -p "$(DIST_DIR)"
-	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 $(GO) build -trimpath -ldflags "$(LDFLAGS)" -o "$(DIST_DIR)/wush_linux_amd64" $(PACKAGE)
+	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 $(GO) build -trimpath -ldflags "$(LDFLAGS)" -o "$(DIST_DIR)/tsok_linux_amd64" $(PACKAGE)
 
 linux-arm64:
 	@mkdir -p "$(DIST_DIR)"
-	CGO_ENABLED=0 GOOS=linux GOARCH=arm64 $(GO) build -trimpath -ldflags "$(LDFLAGS)" -o "$(DIST_DIR)/wush_linux_arm64" $(PACKAGE)
+	CGO_ENABLED=0 GOOS=linux GOARCH=arm64 $(GO) build -trimpath -ldflags "$(LDFLAGS)" -o "$(DIST_DIR)/tsok_linux_arm64" $(PACKAGE)
 
 darwin: darwin-amd64 darwin-arm64
 
 darwin-amd64:
 	@mkdir -p "$(DIST_DIR)"
-	CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 $(GO) build -trimpath -ldflags "$(LDFLAGS)" -o "$(DIST_DIR)/wush_darwin_amd64" $(PACKAGE)
+	CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 $(GO) build -trimpath -ldflags "$(LDFLAGS)" -o "$(DIST_DIR)/tsok_darwin_amd64" $(PACKAGE)
 
 darwin-arm64:
 	@mkdir -p "$(DIST_DIR)"
-	CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 $(GO) build -trimpath -ldflags "$(LDFLAGS)" -o "$(DIST_DIR)/wush_darwin_arm64" $(PACKAGE)
+	CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 $(GO) build -trimpath -ldflags "$(LDFLAGS)" -o "$(DIST_DIR)/tsok_darwin_arm64" $(PACKAGE)
 
 release-builds: linux darwin
 

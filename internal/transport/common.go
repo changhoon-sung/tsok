@@ -72,7 +72,7 @@ func LoadDERPMap(ctx context.Context, path string) (*tailcfg.DERPMap, error) {
 func newTSNet(direction string, opts CommonOptions, controlURL string) (*tsnet.Server, error) {
 	srv := &tsnet.Server{
 		Dir:        os.TempDir(),
-		Hostname:   "wush-" + direction,
+		Hostname:   "tsok-" + direction,
 		Ephemeral:  true,
 		AuthKey:    direction,
 		ControlURL: controlURL,
@@ -87,7 +87,7 @@ func newTSNet(direction string, opts CommonOptions, controlURL string) (*tsnet.S
 		srv.UserLogf = logf
 	}
 
-	state, err := store.New(func(string, ...any) {}, "mem:wush")
+	state, err := store.New(func(string, ...any) {}, "mem:tsok")
 	if err != nil {
 		return nil, fmt.Errorf("create state store: %w", err)
 	}

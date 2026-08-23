@@ -23,7 +23,7 @@ import (
 	"tailscale.com/types/key"
 	"tailscale.com/util/eventbus"
 
-	"github.com/coder/wush/cliui"
+	"github.com/changhoon-sung/tsok/cliui"
 )
 
 func NewReceiveOverlay(logger *slog.Logger, hlog Logf, dm *tailcfg.DERPMap) *Receive {

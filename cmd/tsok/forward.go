@@ -16,9 +16,9 @@ import (
 
 	"tailscale.com/tailcfg"
 
+	"github.com/changhoon-sung/tsok/cliui"
+	transportcore "github.com/changhoon-sung/tsok/internal/transport"
 	"github.com/coder/serpent"
-	"github.com/coder/wush/cliui"
-	transportcore "github.com/coder/wush/internal/transport"
 )
 
 func forwardCmd() *serpent.Command {
@@ -38,27 +38,27 @@ func forwardCmd() *serpent.Command {
 	)
 	return &serpent.Command{
 		Use:   "forward",
-		Short: "Forward local endpoints to ports on the wush server.",
+		Short: "Forward local endpoints to ports on the tsok server.",
 		Long: formatExamples(
 			example{
 				Description: "Forward host TCP port 1234 to local port 5678",
-				Command:     "wush forward --tcp 5678:1234",
+				Command:     "tsok forward --tcp 5678:1234",
 			},
 			example{
 				Description: "Forward a single UDP port",
-				Command:     "wush forward --udp 9000",
+				Command:     "tsok forward --udp 9000",
 			},
 			example{
 				Description: "Forward stdin and stdout to a TCP port for OpenSSH ProxyCommand",
-				Command:     "wush forward --tcp-stdio 22",
+				Command:     "tsok forward --tcp-stdio 22",
 			},
 			example{
 				Description: "Forward multiple TCP ports and a UDP port",
-				Command:     "wush forward --tcp 8080:8080 --tcp 9000:3000 --udp 5353:53",
+				Command:     "tsok forward --tcp 8080:8080 --tcp 9000:3000 --udp 5353:53",
 			},
 			example{
 				Description: "Forward specifying the local address to bind",
-				Command:     "wush forward --tcp 1.2.3.4:8080:8080",
+				Command:     "tsok forward --tcp 1.2.3.4:8080:8080",
 			},
 		),
 		Middleware: serpent.Chain(
@@ -165,8 +165,8 @@ func forwardCmd() *serpent.Command {
 		Options: []serpent.Option{
 			{
 				Flag:        "auth-key",
-				Env:         "WUSH_AUTH_KEY",
-				Description: "The auth key returned by " + cliui.Code("wush serve") + ". If not provided, it will be asked for on startup.",
+				Env:         "TSOK_AUTH_KEY",
+				Description: "The auth key returned by " + cliui.Code("tsok serve") + ". If not provided, it will be asked for on startup.",
 				Default:     "",
 				Value:       serpent.StringOf(&authKey),
 			},
@@ -192,13 +192,13 @@ func forwardCmd() *serpent.Command {
 			{
 				Flag:          "tcp",
 				FlagShorthand: "p",
-				Env:           "WUSH_FORWARD_TCP",
+				Env:           "TSOK_FORWARD_TCP",
 				Description:   "Forward TCP port(s) from the peer to the local machine.",
 				Value:         serpent.StringArrayOf(&tcpForwards),
 			},
 			{
 				Flag:        "udp",
-				Env:         "WUSH_FORWARD_UDP",
+				Env:         "TSOK_FORWARD_UDP",
 				Description: "Forward UDP port(s) from the peer to the local machine. The UDP connection has TCP-like semantics to support stateful UDP protocols.",
 				Value:       serpent.StringArrayOf(&udpForwards),
 			},

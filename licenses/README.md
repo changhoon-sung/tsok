@@ -1,6 +1,6 @@
 # Dependency licenses
 
-`wush.md` lists the union of dependencies linked into the four release
+`tsok.md` lists the union of dependencies linked into the four release
 targets: Linux and macOS on `amd64` and `arm64`.
 
 The report is generated with

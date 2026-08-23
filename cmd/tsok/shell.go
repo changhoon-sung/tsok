@@ -8,10 +8,10 @@ import (
 
 	"tailscale.com/tailcfg"
 
+	"github.com/changhoon-sung/tsok/cliui"
+	transportcore "github.com/changhoon-sung/tsok/internal/transport"
+	xssh "github.com/changhoon-sung/tsok/xssh"
 	"github.com/coder/serpent"
-	"github.com/coder/wush/cliui"
-	transportcore "github.com/coder/wush/internal/transport"
-	xssh "github.com/coder/wush/xssh"
 )
 
 const shellDirectNegotiationTimeout = 5 * time.Second
@@ -30,20 +30,20 @@ func shellCmd() *serpent.Command {
 	return &serpent.Command{
 		Use:     "shell [command...]",
 		Aliases: []string{},
-		Short:   "Open a zero-configuration shell on a wush server.",
-		Long: "Open an interactive shell or run one command as the user running " + cliui.Code("wush serve") + "." +
-			"\n\nThe auth key grants that user's shell privileges. If " + cliui.Code("wush serve") +
+		Short:   "Open a zero-configuration shell on a tsok server.",
+		Long: "Open an interactive shell or run one command as the user running " + cliui.Code("tsok serve") + "." +
+			"\n\nThe auth key grants that user's shell privileges. If " + cliui.Code("tsok serve") +
 			" runs as root, the auth key grants a root shell." +
 			"\n\nFor SFTP, agent forwarding, per-user SSH authentication, SSH certificates, or SSH port forwarding," +
-			" use system OpenSSH with " + cliui.Code("wush forward --tcp-stdio") + "." +
+			" use system OpenSSH with " + cliui.Code("tsok forward --tcp-stdio") + "." +
 			"\n\n" + formatExamples(
 			example{
 				Description: "Open an interactive shell",
-				Command:     "WUSH_AUTH_KEY=<auth-key> wush shell",
+				Command:     "TSOK_AUTH_KEY=<auth-key> tsok shell",
 			},
 			example{
 				Description: "Run one remote command",
-				Command:     "WUSH_AUTH_KEY=<auth-key> wush shell -- uname -a",
+				Command:     "TSOK_AUTH_KEY=<auth-key> tsok shell -- uname -a",
 			},
 		),
 		Middleware: serpent.Chain(
@@ -85,8 +85,8 @@ func shellCmd() *serpent.Command {
 		Options: []serpent.Option{
 			{
 				Flag:        "auth-key",
-				Env:         "WUSH_AUTH_KEY",
-				Description: "The auth key returned by " + cliui.Code("wush serve") + ". If not provided, it will be asked for on startup.",
+				Env:         "TSOK_AUTH_KEY",
+				Description: "The auth key returned by " + cliui.Code("tsok serve") + ". If not provided, it will be asked for on startup.",
 				Default:     "",
 				Value:       serpent.StringOf(&clientOpts.authKey),
 			},

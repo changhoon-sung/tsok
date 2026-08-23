@@ -1,5 +1,5 @@
 {
-  description = "Development shell for the wush CLI";
+  description = "Development shell for the tsok CLI";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";

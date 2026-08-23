@@ -17,8 +17,8 @@ import (
 	"tailscale.com/tailcfg"
 	"tailscale.com/tsnet"
 
-	"github.com/coder/wush/overlay"
-	"github.com/coder/wush/tsserver"
+	"github.com/changhoon-sung/tsok/overlay"
+	"github.com/changhoon-sung/tsok/tsserver"
 )
 
 type ClientOptions struct {

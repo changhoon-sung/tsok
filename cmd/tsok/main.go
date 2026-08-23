@@ -42,6 +42,7 @@ func main() {
 		},
 		Children: []*serpent.Command{
 			versionCmd(),
+			updateCmd(),
 			licensesCmd(),
 			shellCmd(),
 			serveCmd(),

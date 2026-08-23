@@ -183,7 +183,7 @@ func TestServeConnectionHelp(t *testing.T) {
 	t.Parallel()
 
 	got := serveConnectionHelp("test-auth-key", "alice", true)
-	want := `Connect with system OpenSSH:
+	want := `Connect with SSH:
 TSOK_AUTH_KEY=test-auth-key ssh -o 'ProxyCommand=tsok forward --tcp-stdio %p --quiet' alice@tsok
 
 Or add this block to ~/.ssh/config:
@@ -205,6 +205,9 @@ Host tsok
 
 	if strings.Contains(got, "zero-configuration shell") || strings.Contains(got, "tsok shell") {
 		t.Fatalf("connection help contains built-in shell guidance: %q", got)
+	}
+	if !strings.Contains(got, "Connect with SSH:\nTSOK_AUTH_KEY=") {
+		t.Fatalf("connection help does not show the SSH command block: %q", got)
 	}
 	if !strings.Contains(got, "config:\n\nHost tsok") {
 		t.Fatalf("connection help does not separate the config block: %q", got)

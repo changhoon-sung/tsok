@@ -1,24 +1,26 @@
 package cliui
 
 import (
+	"errors"
 	"flag"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/muesli/termenv"
-	"golang.org/x/xerrors"
 
 	"github.com/coder/pretty"
 )
 
-var Canceled = xerrors.New("canceled")
+var Canceled = errors.New("canceled")
 
 // DefaultStyles compose visual elements of the UI.
 var DefaultStyles Styles
 
 type Styles struct {
 	Code,
+	ConfigBlock,
 	DateTimeStamp,
 	Error,
 	Field,
@@ -106,6 +108,15 @@ func Code(s string) string {
 	return pretty.Sprint(DefaultStyles.Code, s)
 }
 
+// ConfigBlock formats each line as a subtle, neutral terminal block.
+func ConfigBlock(s string) string {
+	lines := strings.Split(s, "\n")
+	for index, line := range lines {
+		lines[index] = pretty.Sprint(DefaultStyles.ConfigBlock, line)
+	}
+	return strings.Join(lines, "\n")
+}
+
 // Field formats a field for display.
 func Field(s string) string {
 	return pretty.Sprint(DefaultStyles.Field, s)
@@ -127,6 +138,10 @@ func init() {
 			ifTerm(pretty.XPad(1, 1)),
 			pretty.FgColor(Red),
 			pretty.BgColor(color.Color("#2c2c2c")),
+		},
+		ConfigBlock: pretty.Style{
+			ifTerm(pretty.XPad(1, 1)),
+			pretty.BgColor(color.Color("#242424")),
 		},
 		DateTimeStamp: pretty.Style{
 			pretty.FgColor(color.Color("#7571F9")),
@@ -172,7 +187,7 @@ func init() {
 // ValidateNotEmpty is a helper function to disallow empty inputs!
 func ValidateNotEmpty(s string) error {
 	if s == "" {
-		return xerrors.New("Must be provided!")
+		return errors.New("Must be provided!")
 	}
 	return nil
 }

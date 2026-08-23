@@ -1,5 +1,5 @@
-//go:build !windows && !js && !wasm
-// +build !windows,!js,!wasm
+//go:build !windows
+// +build !windows
 
 package xssh
 

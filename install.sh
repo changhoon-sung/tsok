@@ -2,9 +2,9 @@
 
 set -eu
 
-GITHUB_REPO="coder/wush"
-BINARY_NAME="wush"
-INSTALL_DIR="/usr/local/bin"
+GITHUB_REPO="changhoon-sung/tsok"
+BINARY_NAME="tsok"
+INSTALL_DIR="${HOME:?HOME must be set}/.local/bin"
 
 # Function to determine the platform
 detect_platform() {
@@ -18,12 +18,6 @@ detect_platform() {
     Darwin)
       PLATFORM="darwin"
       ;;
-    FreeBSD)
-      PLATFORM="freebsd"
-      ;;
-    CYGWIN*|MINGW*|MSYS*)
-      PLATFORM="windows"
-      ;;
     *)
       echo "Unsupported OS: $OS"
       exit 1
@@ -33,12 +27,6 @@ detect_platform() {
   case $ARCH in
     x86_64|amd64)
       ARCH="amd64"
-      ;;
-    i386|i686)
-      ARCH="386"
-      ;;
-    armv7l|armv6l)
-      ARCH="armv7"
       ;;
     aarch64|arm64)
       ARCH="arm64"
@@ -52,114 +40,58 @@ detect_platform() {
   echo "${PLATFORM}_${ARCH}"
 }
 
-# Function to determine the preferred archive format
-select_archive_format() {
-  PLATFORM_ARCH=$1
-
-  case "$PLATFORM_ARCH" in
-    darwin_*)
-      # Check if Homebrew is installed
-      if command -v brew >/dev/null 2>&1; then
-        >&2 echo "Using Homebrew for installation."
-        brew install "$BINARY_NAME"  # Install using Homebrew
-        exit 0  # Exit after installation
-      else
-        echo "zip"  # We only ship .zip archives for macOS
-      fi
-      ;;
-    windows_*)
-      echo "zip"  # We only ship .zip archives for Windows
-      ;;
-    *)
-      if command -v tar >/dev/null 2>&1; then
-        echo "tar.gz"
-      elif command -v unzip >/dev/null 2>&1; then
-        echo "zip"
-      else
-        echo "Unsupported: neither tar nor unzip are available."
-        exit 1
-      fi
-      ;;
-  esac
-}
-
 main() {
   PLATFORM_ARCH=$(detect_platform)
+  ARCHIVE_NAME="${BINARY_NAME}_${PLATFORM_ARCH}.tar.gz"
 
-  # Determine preferred archive format
-  FILE_EXT=$(select_archive_format "$PLATFORM_ARCH")
-
-  # Get the latest release download URL from GitHub API
+  # Get the matching archive from the latest GitHub release.
   LATEST_RELEASE_URL=$(curl -fsSL \
     "https://api.github.com/repos/$GITHUB_REPO/releases/latest" \
         | grep "browser_download_url" \
-        | grep "$PLATFORM_ARCH.$FILE_EXT" \
+        | grep "/$ARCHIVE_NAME\"" \
         | cut -d '"' -f 4 | head -n 1)
 
   if [ -z "$LATEST_RELEASE_URL" ]; then
-    echo "No release found for platform $PLATFORM_ARCH with format $FILE_EXT"
+    echo "No tsok release archive found for $PLATFORM_ARCH" >&2
     exit 1
   fi
 
-  # Download the release archive
-  TMP_DIR=$(mktemp -d)
-  ARCHIVE_PATH="$TMP_DIR/$BINARY_NAME.$FILE_EXT"
+  TMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/tsok-install.XXXXXX")
+  ARCHIVE_PATH="$TMP_DIR/$ARCHIVE_NAME"
+  BINARY_PATH="$TMP_DIR/$BINARY_NAME"
+  cleanup() {
+    rm -f -- "$ARCHIVE_PATH" "$BINARY_PATH"
+    rmdir -- "$TMP_DIR" 2>/dev/null || true
+  }
+  trap cleanup EXIT
+  trap 'exit 1' HUP INT TERM
 
-  echo "Downloading $BINARY_NAME from $LATEST_RELEASE_URL..."
-  curl -L -o "$ARCHIVE_PATH" "$LATEST_RELEASE_URL"
+  echo "Downloading $ARCHIVE_NAME..."
+  curl -fsSL -o "$ARCHIVE_PATH" "$LATEST_RELEASE_URL"
 
-
-  # Extract the archive
-  echo "Extracting $BINARY_NAME..."
-  if [ "$FILE_EXT" = "zip" ]; then
-    unzip -d "$TMP_DIR" "$ARCHIVE_PATH"
-  elif [ "$FILE_EXT" = "tar.gz" ]; then
-    tar -xzf "$ARCHIVE_PATH" -C "$TMP_DIR"
-  else
-    echo "Unsupported file extension: $FILE_EXT"
+  if [ "$(tar -tzf "$ARCHIVE_PATH")" != "$BINARY_NAME" ]; then
+    echo "Release archive contains unexpected files" >&2
+    exit 1
+  fi
+  tar -xzf "$ARCHIVE_PATH" -C "$TMP_DIR"
+  if [ ! -f "$BINARY_PATH" ]; then
+    echo "Release archive does not contain $BINARY_NAME" >&2
     exit 1
   fi
 
-  # Find the binary (assuming it's in the extracted files)
-  BINARY_PATH=$(find "$TMP_DIR" -type f -name "$BINARY_NAME")
+  mkdir -p "$INSTALL_DIR"
+  install -m 0755 "$BINARY_PATH" "$INSTALL_DIR/$BINARY_NAME"
 
-  # Make the binary executable
-  chmod +x "$BINARY_PATH"
-
-  # Install the binary
-  if [ "$PLATFORM_ARCH" = "windows-amd64" ] || [ "$PLATFORM_ARCH" = "windows-386" ]; then
-    INSTALL_DIR="$HOME/bin"
-    mkdir -p "$INSTALL_DIR"
-    mv "$BINARY_PATH" "$INSTALL_DIR/$BINARY_NAME.exe"
-  else
-    # Run using sudo if not root
-    if [ "$(id -u)" -ne 0 ]; then
-      sudo sh <<EOF
-        if [ "$(uname -s)" = "Linux" ]; then
-          if command -v setcap >/dev/null 2>&1; then
-            setcap cap_net_admin=eip "$BINARY_PATH"
-          else
-            echo "Warning: 'setcap' command is not available. Transfer speeds may be slower."
-          fi
-        fi
-        mv "$BINARY_PATH" "$INSTALL_DIR/$BINARY_NAME"
-EOF
-    else
-        if [ "$(uname -s)" = "Linux" ]; then
-          if command -v setcap >/dev/null 2>&1; then
-            setcap cap_net_admin=eip "$BINARY_PATH"
-          else
-            echo "Warning: 'setcap' command is not available. Transfer speeds may be slower."
-          fi
-        fi
-        mv "$BINARY_PATH" "$INSTALL_DIR/$BINARY_NAME"
-    fi
-  fi
-
-  # Clean up
-  rm -rf "$TMP_DIR"
-
-  echo "$BINARY_NAME installed successfully!"
+  echo "$BINARY_NAME installed to $INSTALL_DIR/$BINARY_NAME"
+  case ":${PATH:-}:" in
+    *":$INSTALL_DIR:"*) ;;
+    *)
+      echo 'Add tsok to your PATH:'
+      # Keep these variables literal so the user can paste the command.
+      # shellcheck disable=SC2016
+      echo '  export PATH="$HOME/.local/bin:$PATH"'
+      ;;
+  esac
 }
 
 # Run the installation

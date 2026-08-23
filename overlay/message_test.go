@@ -1,0 +1,360 @@
+package overlay
+
+import (
+	"context"
+	"encoding/json"
+	"log/slog"
+	"strings"
+	"testing"
+	"time"
+
+	"tailscale.com/tailcfg"
+	"tailscale.com/types/key"
+)
+
+func TestSendRejectsMalformedOverlayMessage(t *testing.T) {
+	t.Parallel()
+
+	receiverPrivate := key.NewNode()
+	overlayPrivate := key.NewNode()
+	send := &Send{
+		Logger:    slog.Default(),
+		SessionID: "session-a",
+		Auth: ClientAuth{
+			OverlayPrivateKey: overlayPrivate,
+			ReceiverPublicKey: receiverPrivate.Public(),
+		},
+	}
+	sealed := receiverPrivate.SealTo(overlayPrivate.Public(), []byte("{"))
+	if _, err := send.handleNextMessage(sealed); err == nil {
+		t.Fatal("handleNextMessage() succeeded for malformed JSON")
+	}
+}
+
+func TestNewSendOverlayInitializesLogger(t *testing.T) {
+	t.Parallel()
+
+	logger := slog.Default()
+	send := NewSendOverlay(logger, &tailcfg.DERPMap{})
+	if send.Logger != logger {
+		t.Fatal("send overlay did not retain its logger")
+	}
+}
+
+func TestSendIgnoresLegacyWebRTCResponseField(t *testing.T) {
+	t.Parallel()
+
+	receiverPrivate := key.NewNode()
+	overlayPrivate := key.NewNode()
+	send := &Send{
+		Logger:    slog.Default(),
+		SessionID: "session-a",
+		Auth: ClientAuth{
+			OverlayPrivateKey: overlayPrivate,
+			ReceiverPublicKey: receiverPrivate.Public(),
+		},
+		in: make(chan PeerUpdate, 1),
+	}
+	legacyResponse := []byte(`{"Typ":4,"Node":{},"WebrtcDescription":{"type":"answer","sdp":"legacy"}}`)
+	sealed := receiverPrivate.SealTo(overlayPrivate.Public(), legacyResponse)
+	if _, err := send.handleNextMessage(sealed); err != nil {
+		t.Fatalf("handle legacy hello response: %v", err)
+	}
+	if len(send.in) != 1 {
+		t.Fatalf("received node count = %d, want 1", len(send.in))
+	}
+}
+
+func TestSendRejectsResponseForAnotherSession(t *testing.T) {
+	t.Parallel()
+
+	receiverPrivate := key.NewNode()
+	overlayPrivate := key.NewNode()
+	send := &Send{
+		Logger:    slog.Default(),
+		SessionID: "session-a",
+		Auth: ClientAuth{
+			OverlayPrivateKey: overlayPrivate,
+			ReceiverPublicKey: receiverPrivate.Public(),
+		},
+	}
+	raw, err := json.Marshal(overlayMessage{Typ: messageTypePong, SessionID: "session-b"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sealed := receiverPrivate.SealTo(overlayPrivate.Public(), raw)
+	if _, err := send.handleNextMessage(sealed); err == nil || !strings.Contains(err.Error(), "another session") {
+		t.Fatalf("handleNextMessage() error = %v, want another session", err)
+	}
+}
+
+func TestReceiveRejectsMalformedOverlayMessage(t *testing.T) {
+	t.Parallel()
+
+	receive := &Receive{
+		SelfPriv: key.NewNode(),
+		PeerPriv: key.NewNode(),
+	}
+	sealed := receive.PeerPriv.SealTo(receive.SelfPriv.Public(), []byte("{"))
+	if _, err := receive.handleNextMessage(testPeerSource(), sealed, "test"); err == nil {
+		t.Fatal("handleNextMessage() succeeded for malformed JSON")
+	}
+}
+
+func TestReceiveTracksMultipleActivePeersAndGoodbye(t *testing.T) {
+	t.Parallel()
+
+	receive := newTestReceive()
+	for i, sessionID := range []string{"session-a", "session-b"} {
+		hello := sealReceiveMessage(t, receive, overlayMessage{Typ: messageTypeHello, SessionID: sessionID})
+		if _, err := receive.handleNextMessage(testPeerSource(), hello, "test"); err != nil {
+			t.Fatalf("accept %s: %v", sessionID, err)
+		}
+		node := tailcfg.Node{ID: tailcfg.NodeID(i + 1), Key: key.NewNode().Public()}
+		update := sealReceiveMessage(t, receive, overlayMessage{
+			Typ:       messageTypeNodeUpdate,
+			SessionID: sessionID,
+			Node:      node,
+		})
+		if _, err := receive.handleNextMessage(testPeerSource(), update, "test"); err != nil {
+			t.Fatalf("update from %s: %v", sessionID, err)
+		}
+	}
+	if got := len(receive.peers); got != 2 {
+		t.Fatalf("active peer count = %d, want 2", got)
+	}
+	if got := len(receive.in); got != 2 {
+		t.Fatalf("received update count = %d, want 2", got)
+	}
+
+	goodbye := sealReceiveMessage(t, receive, overlayMessage{
+		Typ:       messageTypeGoodbye,
+		SessionID: "session-a",
+	})
+	if _, err := receive.handleNextMessage(testPeerSource(), goodbye, "test"); err != nil {
+		t.Fatalf("goodbye: %v", err)
+	}
+	if got := len(receive.peers); got != 1 {
+		t.Fatalf("active peer count after goodbye = %d, want 1", got)
+	}
+	var removal PeerUpdate
+	for len(receive.in) > 0 {
+		removal = <-receive.in
+	}
+	if removal.ID != "session-a" || removal.Node != nil {
+		t.Fatalf("removal = %#v, want nil update for session-a", removal)
+	}
+}
+
+func TestReceiveRequiresHelloBeforeNodeUpdate(t *testing.T) {
+	t.Parallel()
+
+	receive := newTestReceive()
+	update := sealReceiveMessage(t, receive, overlayMessage{
+		Typ:       messageTypeNodeUpdate,
+		SessionID: "session-a",
+		Node:      tailcfg.Node{ID: 1, Key: key.NewNode().Public()},
+	})
+	if _, err := receive.handleNextMessage(testPeerSource(), update, "test"); err == nil || !strings.Contains(err.Error(), "must be hello") {
+		t.Fatalf("first update error = %v, want hello requirement", err)
+	}
+	if len(receive.in) != 0 {
+		t.Fatalf("received node count = %d, want 0", len(receive.in))
+	}
+}
+
+func TestReceiveTracksSessionAcrossDERPKeyChange(t *testing.T) {
+	t.Parallel()
+
+	receive := newTestReceive()
+	firstSource := testPeerSource()
+	hello := sealReceiveMessage(t, receive, overlayMessage{
+		Typ:       messageTypeHello,
+		SessionID: "session-a",
+	})
+	if _, err := receive.handleNextMessage(firstSource, hello, "test"); err != nil {
+		t.Fatal(err)
+	}
+	secondSource := testPeerSource()
+	ping := sealReceiveMessage(t, receive, overlayMessage{
+		Typ:       messageTypePing,
+		SessionID: "session-a",
+	})
+	if _, err := receive.handleNextMessage(secondSource, ping, "test"); err != nil {
+		t.Fatal(err)
+	}
+	peers := receive.derpPeers()
+	if len(peers) != 1 || peers[0].key != secondSource.derpKey {
+		t.Fatalf("DERP peers = %#v, want session on updated DERP key", peers)
+	}
+}
+
+func TestReceiveOpensUDPForAuthenticatedSession(t *testing.T) {
+	t.Parallel()
+
+	receive := newTestReceive()
+	source := testPeerSource()
+	hello := sealReceiveMessage(t, receive, overlayMessage{Typ: messageTypeHello, SessionID: "session-a"})
+	if _, err := receive.handleNextMessage(source, hello, "test"); err != nil {
+		t.Fatal(err)
+	}
+
+	var gotSession string
+	var gotPort uint16
+	receive.SetOpenUDPHandler(func(sessionID string, port uint16) error {
+		gotSession, gotPort = sessionID, port
+		return nil
+	})
+	request := sealReceiveMessage(t, receive, overlayMessage{
+		Typ:       messageTypeOpenUDP,
+		SessionID: "session-a",
+		RequestID: "request-a",
+		UDPPort:   5353,
+	})
+	sealedResponse, err := receive.handleNextMessage(source, request, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotSession != "session-a" || gotPort != 5353 {
+		t.Fatalf("UDP handler = (%q, %d), want (session-a, 5353)", gotSession, gotPort)
+	}
+
+	cleartext, ok := receive.PeerPriv.OpenFrom(receive.SelfPriv.Public(), sealedResponse)
+	if !ok {
+		t.Fatal("decrypt UDP response")
+	}
+	var response overlayMessage
+	if err := json.Unmarshal(cleartext, &response); err != nil {
+		t.Fatal(err)
+	}
+	if response.Typ != messageTypeOpenUDPResponse || response.RequestID != "request-a" || response.UDPPort != 5353 || response.Error != "" {
+		t.Fatalf("UDP response = %#v", response)
+	}
+}
+
+func TestReceiveRejectsUDPWhenForwardingDisabled(t *testing.T) {
+	t.Parallel()
+
+	receive := newTestReceive()
+	source := testPeerSource()
+	hello := sealReceiveMessage(t, receive, overlayMessage{Typ: messageTypeHello, SessionID: "session-a"})
+	if _, err := receive.handleNextMessage(source, hello, "test"); err != nil {
+		t.Fatal(err)
+	}
+	request := sealReceiveMessage(t, receive, overlayMessage{
+		Typ: messageTypeOpenUDP, SessionID: "session-a", RequestID: "request-a", UDPPort: 53,
+	})
+	sealedResponse, err := receive.handleNextMessage(source, request, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cleartext, ok := receive.PeerPriv.OpenFrom(receive.SelfPriv.Public(), sealedResponse)
+	if !ok {
+		t.Fatal("decrypt UDP response")
+	}
+	var response overlayMessage
+	if err := json.Unmarshal(cleartext, &response); err != nil {
+		t.Fatal(err)
+	}
+	if response.Error != "UDP forwarding is disabled" {
+		t.Fatalf("UDP response error = %q", response.Error)
+	}
+}
+
+func TestSendOpenUDPCorrelatesResponse(t *testing.T) {
+	t.Parallel()
+
+	receiverPrivate := key.NewNode()
+	overlayPrivate := key.NewNode()
+	send := &Send{
+		Logger: slog.Default(), SessionID: "session-a",
+		Auth: ClientAuth{OverlayPrivateKey: overlayPrivate, ReceiverPublicKey: receiverPrivate.Public()},
+		out:  make(chan *overlayMessage, 1), done: make(chan struct{}),
+	}
+	result := make(chan error, 1)
+	go func() { result <- send.OpenUDP(context.Background(), 5353) }()
+	request := <-send.out
+	if request.Typ != messageTypeOpenUDP || request.SessionID != "session-a" || request.UDPPort != 5353 || request.RequestID == "" {
+		t.Fatalf("UDP request = %#v", request)
+	}
+	raw, err := json.Marshal(overlayMessage{
+		Typ: messageTypeOpenUDPResponse, SessionID: "session-a", RequestID: request.RequestID, UDPPort: 5353,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sealed := receiverPrivate.SealTo(overlayPrivate.Public(), raw)
+	if _, err := send.handleNextMessage(sealed); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-result; err != nil {
+		t.Fatalf("OpenUDP: %v", err)
+	}
+}
+
+func TestReceiveNotifiesUDPLeaseOnGoodbye(t *testing.T) {
+	t.Parallel()
+
+	receive := newTestReceive()
+	source := testPeerSource()
+	closed := make(chan string, 1)
+	receive.SetSessionClosedHandler(func(sessionID string) { closed <- sessionID })
+	hello := sealReceiveMessage(t, receive, overlayMessage{Typ: messageTypeHello, SessionID: "session-a"})
+	if _, err := receive.handleNextMessage(source, hello, "test"); err != nil {
+		t.Fatal(err)
+	}
+	goodbye := sealReceiveMessage(t, receive, overlayMessage{Typ: messageTypeGoodbye, SessionID: "session-a"})
+	if _, err := receive.handleNextMessage(source, goodbye, "test"); err != nil {
+		t.Fatal(err)
+	}
+	if sessionID := <-closed; sessionID != "session-a" {
+		t.Fatalf("closed session = %q", sessionID)
+	}
+}
+
+func TestReceiveExpiresInactivePeers(t *testing.T) {
+	t.Parallel()
+
+	receive := newTestReceive()
+	now := time.Now()
+	receive.peers["expired"] = receivePeer{lastSeen: now.Add(-peerInactiveTimeout)}
+	receive.peers["active"] = receivePeer{lastSeen: now}
+	receive.expirePeers(now)
+
+	if _, ok := receive.peers["expired"]; ok {
+		t.Fatal("expired peer remains active")
+	}
+	if _, ok := receive.peers["active"]; !ok {
+		t.Fatal("active peer was removed")
+	}
+	update := <-receive.in
+	if update.ID != "expired" || update.Node != nil {
+		t.Fatalf("expiry update = %#v, want removal for expired", update)
+	}
+}
+
+func newTestReceive() *Receive {
+	return &Receive{
+		Logger:    slog.Default(),
+		HumanLogf: func(string, ...any) {},
+		SelfPriv:  key.NewNode(),
+		PeerPriv:  key.NewNode(),
+		peers:     make(map[string]receivePeer),
+		in:        make(chan PeerUpdate, 8),
+	}
+}
+
+func testPeerSource() peerSource {
+	return peerSource{
+		derpKey: key.NewNode().Public(),
+	}
+}
+
+func sealReceiveMessage(t *testing.T, receive *Receive, msg overlayMessage) []byte {
+	t.Helper()
+	raw, err := json.Marshal(msg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return receive.PeerPriv.SealTo(receive.SelfPriv.Public(), raw)
+}

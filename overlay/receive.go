@@ -1,5 +1,5 @@
-//go:build !js && !wasm
-// +build !js,!wasm
+//go:build !js
+// +build !js
 
 package overlay
 
@@ -8,20 +8,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
-	"net"
-	"net/http"
 	"net/netip"
-	"os"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/pion/stun/v3"
-	"github.com/pion/webrtc/v4"
-	"github.com/puzpuzpuz/xsync/v3"
-	"github.com/schollz/progressbar/v3"
 	"tailscale.com/derp"
 	"tailscale.com/derp/derphttp"
 	"tailscale.com/net/netcheck"
@@ -29,22 +21,41 @@ import (
 	"tailscale.com/net/portmapper"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
+	"tailscale.com/util/eventbus"
 
-	"github.com/coder/pretty"
-	"github.com/coder/wush/cliui"
+	"github.com/changhoon-sung/tsok/cliui"
 )
 
 func NewReceiveOverlay(logger *slog.Logger, hlog Logf, dm *tailcfg.DERPMap) *Receive {
 	return &Receive{
-		Logger:      logger,
-		HumanLogf:   hlog,
-		DerpMap:     dm,
-		SelfPriv:    key.NewNode(),
-		PeerPriv:    key.NewNode(),
-		webrtcConns: xsync.NewMapOf[key.NodePublic, *webrtc.PeerConnection](),
-		in:          make(chan *tailcfg.Node, 8),
-		out:         make(chan *overlayMessage, 8),
+		Logger:    logger,
+		HumanLogf: hlog,
+		DerpMap:   dm,
+		SelfPriv:  key.NewNode(),
+		PeerPriv:  key.NewNode(),
+		peers:     make(map[string]receivePeer),
+		in:        make(chan PeerUpdate, 8),
+		out:       make(chan *overlayMessage, 8),
 	}
+}
+
+const (
+	peerKeepAliveInterval = 30 * time.Second
+	peerInactiveTimeout   = 2 * time.Minute
+)
+
+type peerSource struct {
+	derpKey key.NodePublic
+}
+
+type receivePeer struct {
+	source   peerSource
+	lastSeen time.Time
+}
+
+type derpPeer struct {
+	sessionID string
+	key       key.NodePublic
 }
 
 type Receive struct {
@@ -59,20 +70,42 @@ type Receive struct {
 	// key would allow anyone to connect.
 	PeerPriv key.NodePrivate
 
-	// stunIP is the STUN address that can be used for P2P overlay
-	// communication.
-	stunIP netip.AddrPort
-	// derpRegionID is the DERP region that can be used for proxied overlay
-	// communication.
+	// derpRegionID is the DERP region used for overlay communication.
 	derpRegionID uint16
 
-	webrtcConns *xsync.MapOf[key.NodePublic, *webrtc.PeerConnection]
-
 	lastNode atomic.Pointer[tailcfg.Node]
+	peerMu   sync.Mutex
+	peers    map[string]receivePeer
+	reapOnce sync.Once
+
+	handlerMu            sync.RWMutex
+	openUDPHandler       func(sessionID string, port uint16) error
+	sessionClosedHandler func(sessionID string)
 	// in funnels node updates from other peers to us
-	in chan *tailcfg.Node
+	in chan PeerUpdate
 	// out fans out our node updates to peers
 	out chan *overlayMessage
+}
+
+func (r *Receive) SetOpenUDPHandler(handler func(sessionID string, port uint16) error) {
+	r.handlerMu.Lock()
+	r.openUDPHandler = handler
+	r.handlerMu.Unlock()
+}
+
+func (r *Receive) SetSessionClosedHandler(handler func(sessionID string)) {
+	r.handlerMu.Lock()
+	r.sessionClosedHandler = handler
+	r.handlerMu.Unlock()
+}
+
+func (r *Receive) notifySessionClosed(sessionID string) {
+	r.handlerMu.RLock()
+	handler := r.sessionClosedHandler
+	r.handlerMu.RUnlock()
+	if handler != nil {
+		handler(sessionID)
+	}
 }
 
 func (r *Receive) IPs() []netip.Addr {
@@ -84,55 +117,19 @@ func (r *Receive) IPs() []netip.Addr {
 	}
 }
 
-func getWebRTCConfig() webrtc.Configuration {
-	defaultConfig := webrtc.Configuration{
-		ICEServers: []webrtc.ICEServer{
-			{
-				URLs: []string{"stun:stun.l.google.com:19302"},
-			},
-		},
-	}
-
-	resp, err := http.Get("https://wush.dev/api/iceConfig")
-	if err != nil {
-		fmt.Println("failed to get ice config:", err)
-		return defaultConfig
-	}
-	defer resp.Body.Close()
-
-	var iceConfig struct {
-		IceServers []struct {
-			URLs       []string `json:"urls"`
-			Username   string   `json:"username"`
-			Credential string   `json:"credential"`
-		} `json:"iceServers"`
-	}
-
-	if err := json.NewDecoder(resp.Body).Decode(&iceConfig); err != nil {
-		return defaultConfig
-	}
-
-	config := webrtc.Configuration{
-		ICEServers: make([]webrtc.ICEServer, len(iceConfig.IceServers)),
-	}
-	for i, server := range iceConfig.IceServers {
-		config.ICEServers[i] = webrtc.ICEServer{
-			URLs:           server.URLs,
-			Username:       server.Username,
-			Credential:     server.Credential,
-			CredentialType: webrtc.ICECredentialTypePassword,
-		}
-	}
-
-	return config
-}
-
 func (r *Receive) PickDERPHome(ctx context.Context) error {
-
 	nm := netmon.NewStatic()
+	bus := eventbus.New()
+	defer bus.Close()
+	pm := portmapper.NewClient(portmapper.Config{
+		EventBus: bus,
+		Logf:     func(format string, args ...any) {},
+		NetMon:   nm,
+	})
+	defer pm.Close()
 	nc := netcheck.Client{
 		NetMon:     nm,
-		PortMapper: portmapper.NewClient(func(format string, args ...any) {}, nm, nil, nil, nil),
+		PortMapper: pm,
 		Logf:       func(format string, args ...any) {},
 	}
 
@@ -156,12 +153,11 @@ func (r *Receive) ClientAuth() *ClientAuth {
 	return &ClientAuth{
 		OverlayPrivateKey:    r.PeerPriv,
 		ReceiverPublicKey:    r.SelfPriv.Public(),
-		ReceiverStunAddr:     r.stunIP,
 		ReceiverDERPRegionID: r.derpRegionID,
 	}
 }
 
-func (r *Receive) Recv() <-chan *tailcfg.Node {
+func (r *Receive) Recv() <-chan PeerUpdate {
 	return r.in
 }
 
@@ -170,146 +166,6 @@ func (r *Receive) SendTailscaleNodeUpdate(node *tailcfg.Node) {
 		Typ:  messageTypeNodeUpdate,
 		Node: *node.Clone(),
 	}
-}
-
-// gonna have to do something special for per-peer webrtc connections
-
-func (r *Receive) ListenOverlaySTUN(ctx context.Context) (<-chan struct{}, error) {
-	srvAddr, err := net.ResolveUDPAddr("udp4", "stun.l.google.com:19302")
-	if err != nil {
-		return nil, fmt.Errorf("resolve google STUN: %w", err)
-	}
-
-	conn, err := net.ListenUDP("udp4", nil)
-	if err != nil {
-		return nil, fmt.Errorf("listen STUN: %w", err)
-	}
-
-	go func() {
-		<-ctx.Done()
-		_ = conn.Close()
-	}()
-
-	m := stun.MustBuild(stun.TransactionID, stun.BindingRequest)
-
-	restun := time.NewTicker(time.Nanosecond)
-
-	go func() {
-		for {
-			select {
-			case <-ctx.Done():
-				return
-
-			case <-restun.C:
-				_, err = conn.WriteToUDP(m.Raw, srvAddr)
-				if err != nil {
-					r.HumanLogf("%s Failed to write STUN request on overlay: %s", cliui.Timestamp(time.Now()), err)
-				}
-				restun.Reset(30 * time.Second)
-			}
-		}
-	}()
-
-	// node priv -> udp addr
-	peers := xsync.NewMapOf[key.NodePublic, netip.AddrPort]()
-
-	go func() {
-		for {
-
-			select {
-			case <-ctx.Done():
-				return
-			case msg := <-r.out:
-				if msg.Typ == messageTypeNodeUpdate {
-					r.lastNode.Store(&msg.Node)
-				}
-				raw, err := json.Marshal(msg)
-				if err != nil {
-					panic("marshal overlay msg: " + err.Error())
-				}
-
-				sealed := r.SelfPriv.SealTo(r.PeerPriv.Public(), raw)
-				peers.Range(func(_ key.NodePublic, addr netip.AddrPort) bool {
-					_, err := conn.WriteToUDPAddrPort(sealed, addr)
-					if err != nil {
-						r.HumanLogf("%s Failed to send updated node over udp: %s", cliui.Timestamp(time.Now()), err)
-						return false
-					}
-					return true
-				})
-			}
-		}
-	}()
-
-	ipChan := make(chan struct{})
-
-	go func() {
-		var closeIPChanOnce sync.Once
-
-		for {
-			buf := make([]byte, 4<<10)
-			n, addr, err := conn.ReadFromUDPAddrPort(buf)
-			if err != nil {
-				r.Logger.Error("read from STUN; exiting", "err", err)
-				return
-			}
-
-			buf = buf[:n]
-			if stun.IsMessage(buf) {
-				m := new(stun.Message)
-				m.Raw = buf
-
-				if err := m.Decode(); err != nil {
-					r.Logger.Error("decode STUN message; exiting", "err", err)
-					return
-				}
-
-				var xorAddr stun.XORMappedAddress
-				if err := xorAddr.GetFrom(m); err != nil {
-					r.Logger.Error("decode STUN xor mapped addr; exiting", "err", err)
-					return
-				}
-
-				stunAddr, ok := netip.AddrFromSlice(xorAddr.IP)
-				if !ok {
-					r.Logger.Error("convert STUN xor mapped addr", "ip", xorAddr.IP.String())
-					continue
-				}
-				stunAddrPort := netip.AddrPortFrom(stunAddr, uint16(xorAddr.Port))
-
-				// our first STUN response
-				if !r.stunIP.IsValid() {
-					r.HumanLogf("STUN address is %s", cliui.Code(stunAddrPort.String()))
-				}
-
-				if r.stunIP.IsValid() && r.stunIP.Compare(stunAddrPort) != 0 {
-					r.HumanLogf(pretty.Sprintf(cliui.DefaultStyles.Warn, "STUN address changed, this may cause issues; %s->%s", r.stunIP.String(), stunAddrPort.String()))
-				}
-				r.stunIP = stunAddrPort
-				closeIPChanOnce.Do(func() {
-					close(ipChan)
-				})
-				continue
-			}
-
-			res, key, err := r.handleNextMessage(key.NodePublic{}, buf, "STUN")
-			if err != nil {
-				r.HumanLogf("Failed to handle overlay message: %s", err.Error())
-				continue
-			}
-
-			peers.Store(key, addr)
-
-			if res != nil {
-				_, err = conn.WriteToUDPAddrPort(res, addr)
-				if err != nil {
-					r.HumanLogf("Failed to send overlay response over STUN: %s", err.Error())
-					return
-				}
-			}
-		}
-	}()
-	return ipChan, nil
 }
 
 func (r *Receive) ListenOverlayDERP(ctx context.Context) error {
@@ -321,9 +177,7 @@ func (r *Receive) ListenOverlayDERP(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-
-	// node priv -> derp priv
-	peers := xsync.NewMapOf[key.NodePublic, key.NodePublic]()
+	r.startPeerReaper(ctx)
 
 	go func() {
 		for {
@@ -335,20 +189,18 @@ func (r *Receive) ListenOverlayDERP(ctx context.Context) error {
 				if msg.Typ == messageTypeNodeUpdate {
 					r.lastNode.Store(&msg.Node)
 				}
-				raw, err := json.Marshal(msg)
-				if err != nil {
-					panic("marshal overlay msg: " + err.Error())
-				}
-
-				sealed := r.SelfPriv.SealTo(r.PeerPriv.Public(), raw)
-				peers.Range(func(_, derpKey key.NodePublic) bool {
-					err = c.Send(derpKey, sealed)
+				for _, peer := range r.derpPeers() {
+					peerMsg := *msg
+					peerMsg.SessionID = peer.sessionID
+					raw, err := json.Marshal(peerMsg)
 					if err != nil {
-						r.HumanLogf("Send updated node over DERP: %s", err)
-						return false
+						panic("marshal overlay msg: " + err.Error())
 					}
-					return true
-				})
+					sealed := r.SelfPriv.SealTo(r.PeerPriv.Public(), raw)
+					if sendErr := c.Send(peer.key, sealed); sendErr != nil {
+						r.HumanLogf("Send updated node over DERP: %s", sendErr)
+					}
+				}
 			}
 		}
 	}()
@@ -361,13 +213,13 @@ func (r *Receive) ListenOverlayDERP(ctx context.Context) error {
 
 		switch msg := msg.(type) {
 		case derp.ReceivedPacket:
-			res, key, err := r.handleNextMessage(msg.Source, msg.Data, "DERP")
+			res, err := r.handleNextMessage(peerSource{
+				derpKey: msg.Source,
+			}, msg.Data, "DERP")
 			if err != nil {
 				r.HumanLogf("Failed to handle overlay message from %s: %s", msg.Source.ShortString(), err.Error())
 				continue
 			}
-
-			peers.Store(key, msg.Source)
 
 			if res != nil {
 				err = c.Send(msg.Source, res)
@@ -376,23 +228,33 @@ func (r *Receive) ListenOverlayDERP(ctx context.Context) error {
 					return err
 				}
 			}
+		case derp.PeerGoneMessage:
+			r.removeDERPPeers(msg.Peer)
 		}
 	}
 }
 
-func (r *Receive) handleNextMessage(src key.NodePublic, msg []byte, system string) (resRaw []byte, nodeKey key.NodePublic, _ error) {
+func (r *Receive) handleNextMessage(source peerSource, msg []byte, system string) ([]byte, error) {
 	cleartext, ok := r.SelfPriv.OpenFrom(r.PeerPriv.Public(), msg)
 	if !ok {
-		return nil, key.NodePublic{}, errors.New("message failed decryption")
+		return nil, errors.New("message failed decryption")
 	}
 
 	var ovMsg overlayMessage
 	err := json.Unmarshal(cleartext, &ovMsg)
 	if err != nil {
-		panic("unmarshal node: " + err.Error())
+		return nil, fmt.Errorf("unmarshal overlay message: %w", err)
+	}
+	removed, err := r.trackPeer(ovMsg.SessionID, source, ovMsg.Typ, time.Now())
+	if err != nil {
+		return nil, err
+	}
+	if removed {
+		r.notifySessionClosed(ovMsg.SessionID)
+		return nil, nil
 	}
 
-	res := overlayMessage{}
+	res := overlayMessage{SessionID: ovMsg.SessionID}
 	switch ovMsg.Typ {
 	case messageTypePing:
 		res.Typ = messageTypePong
@@ -412,34 +274,43 @@ func (r *Receive) handleNextMessage(src key.NodePublic, msg []byte, system strin
 			res.Node = *lastNode
 		}
 
-		if ovMsg.WebrtcDescription != nil {
-			r.setupWebrtcConnection(src, &res, *ovMsg.WebrtcDescription)
-		}
-
-		r.HumanLogf("%s Received connection request over %s from %s", cliui.Timestamp(time.Now()), system, cliui.Keyword(fmt.Sprintf("%s@%s", username, hostname)))
+		r.HumanLogf("Received connection request over %s from %s", system, cliui.Keyword(fmt.Sprintf("%s@%s", username, hostname)))
 	case messageTypeNodeUpdate:
 		r.Logger.Debug("received updated node", slog.String("node_key", ovMsg.Node.Key.String()))
-		r.in <- &ovMsg.Node
+		r.in <- PeerUpdate{ID: ovMsg.SessionID, Node: ovMsg.Node.Clone()}
 		res.Typ = messageTypeNodeUpdate
 		if lastNode := r.lastNode.Load(); lastNode != nil {
 			res.Node = *lastNode
 		}
-
-	case messageTypeWebRTCCandidate:
-		pc, ok := r.webrtcConns.Load(src)
-		if !ok {
-			fmt.Println("got candidate for unknown connection")
+	case messageTypeOpenUDP:
+		res.Typ = messageTypeOpenUDPResponse
+		res.RequestID = ovMsg.RequestID
+		res.UDPPort = ovMsg.UDPPort
+		if ovMsg.RequestID == "" {
+			res.Error = "UDP request has no request ID"
 			break
 		}
-
-		err := pc.AddICECandidate(*ovMsg.WebrtcCandidate)
-		if err != nil {
-			fmt.Println("failed to add ice candidate:", err)
+		if ovMsg.UDPPort == 0 {
+			res.Error = "UDP port cannot be zero"
+			break
 		}
+		r.handlerMu.RLock()
+		handler := r.openUDPHandler
+		r.handlerMu.RUnlock()
+		if handler == nil {
+			res.Error = "UDP forwarding is disabled"
+			break
+		}
+		if err := handler(ovMsg.SessionID, ovMsg.UDPPort); err != nil {
+			res.Error = err.Error()
+		}
+	default:
+		return nil, fmt.Errorf("unsupported overlay message type %d", ovMsg.Typ)
+
 	}
 
 	if res.Typ == 0 {
-		return nil, ovMsg.Node.Key, nil
+		return nil, nil
 	}
 
 	raw, err := json.Marshal(res)
@@ -448,127 +319,96 @@ func (r *Receive) handleNextMessage(src key.NodePublic, msg []byte, system strin
 	}
 
 	sealed := r.SelfPriv.SealTo(r.PeerPriv.Public(), raw)
-	return sealed, ovMsg.Node.Key, nil
+	return sealed, nil
 }
 
-func (r *Receive) setupWebrtcConnection(src key.NodePublic, res *overlayMessage, offer webrtc.SessionDescription) {
-	// Configure larger buffer sizes
-	settingEngine := webrtc.SettingEngine{}
-	// Set maximum message size to 16MB
-	settingEngine.SetSCTPMaxReceiveBufferSize(64 * 1024 * 1024)
-
-	api := webrtc.NewAPI(webrtc.WithSettingEngine(settingEngine))
-
-	// Use the custom API to create the peer connection
-	peerConnection, err := api.NewPeerConnection(getWebRTCConfig())
-	if err != nil {
-		panic(err)
+func (r *Receive) trackPeer(sessionID string, source peerSource, typ messageType, now time.Time) (bool, error) {
+	if sessionID == "" {
+		return false, errors.New("overlay session ID is empty")
 	}
-
-	peerConnection.OnConnectionStateChange(func(s webrtc.PeerConnectionState) {
-		switch s {
-		case webrtc.PeerConnectionStateConnected:
-		case webrtc.PeerConnectionStateDisconnected:
-		case webrtc.PeerConnectionStateFailed:
-		case webrtc.PeerConnectionStateClosed:
+	if source.derpKey.IsZero() {
+		return false, errors.New("overlay DERP peer key is empty")
+	}
+	r.peerMu.Lock()
+	if r.peers == nil {
+		r.peers = make(map[string]receivePeer)
+	}
+	_, exists := r.peers[sessionID]
+	if typ == messageTypeGoodbye {
+		if exists {
+			delete(r.peers, sessionID)
+			r.in <- PeerUpdate{ID: sessionID}
 		}
-	})
+		r.peerMu.Unlock()
+		return true, nil
+	}
+	if !exists {
+		if typ != messageTypeHello {
+			r.peerMu.Unlock()
+			return false, errors.New("first overlay message must be hello")
+		}
+	}
+	r.peers[sessionID] = receivePeer{source: source, lastSeen: now}
+	r.peerMu.Unlock()
+	return false, nil
+}
 
-	peerConnection.OnDataChannel(func(d *webrtc.DataChannel) {
-		// Increase buffer sizes
-		d.SetBufferedAmountLowThreshold(65535)
+func (r *Receive) derpPeers() []derpPeer {
+	r.peerMu.Lock()
+	defer r.peerMu.Unlock()
+	peers := make([]derpPeer, 0, len(r.peers))
+	for sessionID, peer := range r.peers {
+		peers = append(peers, derpPeer{sessionID: sessionID, key: peer.source.derpKey})
+	}
+	return peers
+}
 
-		var (
-			fi     *os.File
-			bar    *progressbar.ProgressBar
-			mw     io.Writer
-			fiSize int
-			read   int
-		)
+func (r *Receive) removeDERPPeers(peerKey key.NodePublic) {
+	var removed []string
+	r.peerMu.Lock()
+	for sessionID, peer := range r.peers {
+		if peer.source.derpKey == peerKey {
+			delete(r.peers, sessionID)
+			r.in <- PeerUpdate{ID: sessionID}
+			removed = append(removed, sessionID)
+		}
+	}
+	r.peerMu.Unlock()
+	for _, sessionID := range removed {
+		r.notifySessionClosed(sessionID)
+	}
+}
 
-		d.OnMessage(func(msg webrtc.DataChannelMessage) {
-			if msg.IsString {
-				meta := RtcMetadata{}
+func (r *Receive) expirePeers(now time.Time) {
+	cutoff := now.Add(-peerInactiveTimeout)
+	var removed []string
+	r.peerMu.Lock()
+	for sessionID, peer := range r.peers {
+		if !peer.lastSeen.After(cutoff) {
+			delete(r.peers, sessionID)
+			r.in <- PeerUpdate{ID: sessionID}
+			removed = append(removed, sessionID)
+		}
+	}
+	r.peerMu.Unlock()
+	for _, sessionID := range removed {
+		r.notifySessionClosed(sessionID)
+	}
+}
 
-				err := json.Unmarshal(msg.Data, &meta)
-				if err != nil {
-					fmt.Println("failed to unmarshal file metadata:")
-					d.Close()
+func (r *Receive) startPeerReaper(ctx context.Context) {
+	r.reapOnce.Do(func() {
+		go func() {
+			ticker := time.NewTicker(peerKeepAliveInterval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
 					return
-				}
-
-				if meta.Type == RtcMetadataTypeFileMetadata {
-					fiSize = meta.FileMetadata.FileSize
-					fi, err = os.OpenFile(meta.FileMetadata.FileName, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0644)
-					if err != nil {
-						fmt.Println("failed to open file", err)
-					}
-
-					bar = progressbar.DefaultBytes(
-						int64(fiSize),
-						fmt.Sprintf("Downloading %q", meta.FileMetadata.FileName),
-					)
-					mw = io.MultiWriter(fi, bar)
-				}
-
-			} else {
-				read += len(msg.Data)
-				if fi == nil {
-					fmt.Println("Error: Received binary data before file was opened")
-					d.Close()
-					return
-				}
-
-				_, err := mw.Write(msg.Data)
-				if err != nil {
-					fmt.Printf("Failed to write file data: %v\n", err)
-					d.Close()
-					return
-				}
-
-				if read >= fiSize {
-					bar.Close()
-					fmt.Printf("Successfully wrote file %s (%d bytes)\n", fi.Name(), read)
-					err := fi.Close()
-					if err != nil {
-						fmt.Printf("Error closing file: %v\n", err)
-					}
-					fi = nil
-					bar = nil
-					mw = nil
+				case now := <-ticker.C:
+					r.expirePeers(now)
 				}
 			}
-		})
+		}()
 	})
-
-	peerConnection.OnICECandidate(func(i *webrtc.ICECandidate) {
-		if i == nil {
-			return
-		}
-		ic := i.ToJSON()
-
-		r.out <- &overlayMessage{
-			Typ:             messageTypeWebRTCCandidate,
-			WebrtcCandidate: &ic,
-		}
-	})
-
-	err = peerConnection.SetRemoteDescription(offer)
-	if err != nil {
-		fmt.Println("failed to set remote description:", err)
-	}
-
-	answer, err := peerConnection.CreateAnswer(nil)
-	if err != nil {
-		fmt.Println("failed to create answer:", err)
-	}
-
-	err = peerConnection.SetLocalDescription(answer)
-	if err != nil {
-		fmt.Println("failed to set local description:", err)
-	}
-
-	res.WebrtcDescription = &answer
-
-	r.webrtcConns.Store(src, peerConnection)
 }

@@ -7,7 +7,9 @@ package tsserver
 import (
 	"cmp"
 	"context"
+	cryptorand "crypto/rand"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -17,6 +19,7 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -26,21 +29,16 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/klauspost/compress/zstd"
-	"github.com/puzpuzpuz/xsync/v3"
-	"github.com/valyala/fasthttp/fasthttputil"
-	xslices "golang.org/x/exp/slices"
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/h2c"
 	"tailscale.com/control/controlbase"
 	"tailscale.com/control/controlhttp/controlhttpserver"
-	"tailscale.com/net/netns"
-	"tailscale.com/smallzstd"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
 	"tailscale.com/types/opt"
 	"tailscale.com/types/ptr"
 
-	"github.com/coder/wush/overlay"
+	"github.com/changhoon-sung/tsok/overlay"
 )
 
 func DERPMapTailscale(ctx context.Context) (*tailcfg.DERPMap, error) {
@@ -65,36 +63,126 @@ func DERPMapTailscale(ctx context.Context) (*tailcfg.DERPMap, error) {
 }
 
 func NewServer(ctx context.Context, logger *slog.Logger, ov overlay.Overlay, dm *tailcfg.DERPMap) (*server, error) {
+	var secret [32]byte
+	if _, err := cryptorand.Read(secret[:]); err != nil {
+		return nil, fmt.Errorf("generate control server path: %w", err)
+	}
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return nil, fmt.Errorf("listen for local control connection: %w", err)
+	}
+	serverCtx, cancel := context.WithCancel(ctx)
+
 	s := &server{
+		ctx:             serverCtx,
+		cancel:          cancel,
 		logger:          logger,
 		noisePrivateKey: key.NewMachine(),
-		nodeUpdate:      make(chan struct{}, 8),
-		ll:              fasthttputil.NewInmemoryListener(),
-		ml:              &memListen{listen: make(chan net.Conn)},
+		nodeUpdate:      make(chan struct{}, 1),
+		listener:        listener,
+		controlPath:     "/" + hex.EncodeToString(secret[:]),
 		overlay:         ov,
 		derpMap:         dm,
-
-		peerMap:       xsync.NewMapOf[key.NodePublic, *tailcfg.Node](),
-		peerMapUpdate: make(chan update, 8),
+		peers:           newPeerStore(),
+		peerUpdate:      make(chan struct{}, 1),
 	}
 
 	return s, nil
 }
 
 type server struct {
+	ctx             context.Context
+	cancel          context.CancelFunc
 	logger          *slog.Logger
 	derpMap         *tailcfg.DERPMap
 	noisePrivateKey key.MachinePrivate
-	ll              *fasthttputil.InmemoryListener
-	ml              *memListen
+	listener        net.Listener
+	controlPath     string
+	httpMu          sync.Mutex
+	httpServer      *http.Server
+	noiseMu         sync.Mutex
+	noiseConn       *controlbase.Conn
+	noiseActive     atomic.Bool
+	closeOnce       sync.Once
+	closeErr        error
 
 	overlay overlay.Overlay
 
 	node       atomic.Pointer[tailcfg.Node]
 	nodeUpdate chan struct{}
 
-	peerMap       *xsync.MapOf[key.NodePublic, *tailcfg.Node]
-	peerMapUpdate chan update
+	peers      *peerStore
+	peerUpdate chan struct{}
+}
+
+type peerStore struct {
+	mu    sync.RWMutex
+	nodes map[string]*tailcfg.Node
+}
+
+func newPeerStore() *peerStore {
+	return &peerStore{nodes: make(map[string]*tailcfg.Node)}
+}
+
+func (p *peerStore) apply(update overlay.PeerUpdate) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if update.Node == nil {
+		delete(p.nodes, update.ID)
+		return
+	}
+	p.nodes[update.ID] = update.Node.Clone()
+}
+
+func (p *peerStore) snapshot() []*tailcfg.Node {
+	p.mu.RLock()
+	peers := make([]*tailcfg.Node, 0, len(p.nodes))
+	for _, node := range p.nodes {
+		peers = append(peers, node.Clone())
+	}
+	p.mu.RUnlock()
+	slices.SortFunc(peers, func(a, b *tailcfg.Node) int {
+		if idOrder := cmp.Compare(a.ID, b.ID); idOrder != 0 {
+			return idOrder
+		}
+		return strings.Compare(a.Key.String(), b.Key.String())
+	})
+	return peers
+}
+
+func (s *server) ControlURL() string {
+	return "http://" + s.listener.Addr().String() + s.controlPath
+}
+
+func (s *server) Close() error {
+	s.closeOnce.Do(func() {
+		s.cancel()
+		var closeErrors []error
+
+		s.httpMu.Lock()
+		httpServer := s.httpServer
+		s.httpMu.Unlock()
+		if httpServer != nil {
+			if err := httpServer.Close(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				closeErrors = append(closeErrors, err)
+			}
+		}
+		if err := s.listener.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+			closeErrors = append(closeErrors, err)
+		}
+		s.noiseMu.Lock()
+		noiseConn := s.noiseConn
+		s.noiseConn = nil
+		s.noiseMu.Unlock()
+		if noiseConn != nil {
+			if err := noiseConn.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+				closeErrors = append(closeErrors, err)
+			}
+		}
+		s.closeErr = errors.Join(closeErrors...)
+	})
+	return s.closeErr
 }
 
 func (s *server) ListenAndServe(_ context.Context) error {
@@ -104,87 +192,63 @@ func (s *server) ListenAndServe(_ context.Context) error {
 		w.WriteHeader(http.StatusNotFound)
 	}))
 
-	r.Get("/key", s.KeyHandler)
+	r.Get(s.controlPath+"/key", s.KeyHandler)
+	// Tailscale preserves the ControlURL path for HTTP requests, but the outer
+	// Noise upgrade is always sent to the root /ts2021 endpoint.
 	r.Post("/ts2021", s.NoiseUpgradeHandler)
 
 	go func() {
+		recv := s.overlay.Recv()
 		for {
 			select {
-			case node := <-s.overlay.Recv():
-				s.peerMap.Store(node.Key, node)
-				s.peerMapUpdate <- update{
-					ty:   updateTypeNewPeer,
-					node: node,
+			case <-s.ctx.Done():
+				return
+			case update, ok := <-recv:
+				if !ok {
+					return
+				}
+				if update.ID == "" {
+					continue
+				}
+				s.peers.apply(update)
+				select {
+				case s.peerUpdate <- struct{}{}:
+				default:
 				}
 			case <-s.nodeUpdate:
-				s.overlay.SendTailscaleNodeUpdate(s.node.Load())
+				if node := s.node.Load(); node != nil {
+					s.overlay.SendTailscaleNodeUpdate(node.Clone())
+				}
 			}
 		}
 	}()
 
-	return http.Serve(s.ml, r)
-}
-
-type memListen struct {
-	listen chan net.Conn
-}
-
-// Accept waits for and returns the next connection to the listener.
-func (m *memListen) Accept() (net.Conn, error) {
-	c, ok := <-m.listen
-	if !ok {
-		return nil, errors.New("closed")
+	httpServer := &http.Server{
+		Handler:           r,
+		ReadHeaderTimeout: 30 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       30 * time.Second,
+		MaxHeaderBytes:    1 << 20,
 	}
-	return c, nil
-}
+	s.httpMu.Lock()
+	s.httpServer = httpServer
+	s.httpMu.Unlock()
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		select {
+		case <-s.ctx.Done():
+			_ = s.Close()
+		case <-done:
+		}
+	}()
 
-// Close closes the listener.
-// Any blocked Accept operations will be unblocked and return errors.
-func (m *memListen) Close() error {
-	close(m.listen)
-	return nil
-}
-
-// Addr returns the listener's network address.
-func (m *memListen) Addr() net.Addr {
-	return &net.IPAddr{}
-}
-
-func (m *memListen) Dial() (net.Conn, error) {
-	in, out := net.Pipe()
-	m.listen <- in
-	return out, nil
-}
-
-type memDialer struct {
-	ll *fasthttputil.InmemoryListener
-	ml *memListen
-}
-
-func (m memDialer) Dial(network string, address string) (net.Conn, error) {
-	host, port, _ := net.SplitHostPort(address)
-	if host == "127.0.0.1" && port == "443" {
-		return nil, errors.New("tls not supported")
+	err := httpServer.Serve(s.listener)
+	if errors.Is(err, http.ErrServerClosed) || errors.Is(err, net.ErrClosed) {
+		return nil
 	}
-
-	return m.ml.Dial()
-}
-
-func (m memDialer) DialContext(ctx context.Context, network string, address string) (net.Conn, error) {
-	host, port, _ := net.SplitHostPort(address)
-	if (host == "127.0.0.1" || host == "::1") && port == "443" {
-		return nil, errors.New("tls not supported :)")
-	}
-	if host != "127.0.0.1" && host != "::1" {
-		var d net.Dialer
-		return d.DialContext(ctx, network, address)
-	}
-
-	return m.ml.Dial()
-}
-
-func (s *server) Dialer() netns.Dialer {
-	return memDialer{ll: s.ll, ml: s.ml}
+	return err
 }
 
 var ErrNoCapabilityVersion = errors.New("no capability version set")
@@ -234,13 +298,19 @@ func (s *server) KeyHandler(
 }
 
 func (s *server) NoiseUpgradeHandler(w http.ResponseWriter, r *http.Request) {
+	if !s.noiseActive.CompareAndSwap(false, true) {
+		http.Error(w, "a local control connection is already active", http.StatusServiceUnavailable)
+		return
+	}
+	defer s.noiseActive.Store(false)
+
 	s.logger.Info("got noise upgrade request")
 	ns := noiseServer{
 		logger:     s.logger,
 		derpMap:    s.derpMap,
 		challenge:  key.NewChallenge(),
-		peers:      xsync.NewMapOf[tailcfg.NodeID, *tailcfg.Node](),
-		peerUpdate: s.peerMapUpdate,
+		peerStore:  s.peers,
+		peerUpdate: s.peerUpdate,
 		node:       &s.node,
 		nodeUpdate: s.nodeUpdate,
 		getIPs:     s.overlay.IPs,
@@ -251,15 +321,8 @@ func (s *server) NoiseUpgradeHandler(w http.ResponseWriter, r *http.Request) {
 		w,
 		r,
 		s.noisePrivateKey,
-		// ns.earlyNoise,
-		// TODO: for some reason when using an unbuffered network connection
-		// (such as our in-memory connection to the tsserver), the client will
-		// just hang on https://github.com/coadler/tailscale/blob/main/internal/noiseconn/conn.go#L59
-		// and https://github.com/coadler/tailscale/blob/main/control/controlhttp/server.go#L107.
-		// Disabling the early write seems to fix it. Using a buffered network
-		// connection (such as *fasthttputil.InmemoryListener), works somewhat
-		// but still causes random race conditions that causes the connection to
-		// stall.
+		// The regular Noise handlers below provide the complete response, so an
+		// early payload is unnecessary.
 		nil,
 	)
 	if err != nil {
@@ -268,6 +331,24 @@ func (s *server) NoiseUpgradeHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.logger.Info("accepted control http")
+	s.noiseMu.Lock()
+	s.noiseConn = noiseConn
+	s.noiseMu.Unlock()
+	defer func() {
+		s.noiseMu.Lock()
+		if s.noiseConn == noiseConn {
+			s.noiseConn = nil
+		}
+		s.noiseMu.Unlock()
+		_ = noiseConn.Close()
+	}()
+	if s.ctx.Err() != nil {
+		return
+	}
+	if err := noiseConn.SetDeadline(time.Time{}); err != nil {
+		s.logger.Error("clear control connection deadline", "err", err)
+		return
+	}
 
 	ns.conn = noiseConn
 	ns.machineKey = ns.conn.Peer()
@@ -283,9 +364,9 @@ func (s *server) NoiseUpgradeHandler(w http.ResponseWriter, r *http.Request) {
 		s.logger.Info("ts2021 not found", "path", r.URL.Path)
 		w.WriteHeader(http.StatusNotFound)
 	}))
-	rtr.Post("/machine/register", ns.NoiseRegistrationHandler)
-	rtr.HandleFunc("/machine/map", ns.NoisePollNetMapHandler)
-	rtr.Post("/machine/update-health", func(w http.ResponseWriter, r *http.Request) {
+	rtr.Post(s.controlPath+"/machine/register", ns.NoiseRegistrationHandler)
+	rtr.HandleFunc(s.controlPath+"/machine/map", ns.NoisePollNetMapHandler)
+	rtr.Post(s.controlPath+"/machine/update-health", func(w http.ResponseWriter, r *http.Request) {
 		io.Copy(io.Discard, r.Body)
 		r.Body.Close()
 		w.WriteHeader(http.StatusNoContent)
@@ -306,20 +387,6 @@ func (s *server) NoiseUpgradeHandler(w http.ResponseWriter, r *http.Request) {
 	)
 }
 
-type updateType int
-
-const (
-	updateTypeNewPeer updateType = iota
-	updateTypePeerUpdate
-)
-
-type update struct {
-	ty updateType
-
-	node   *tailcfg.Node
-	update *tailcfg.PeerChange
-}
-
 type noiseServer struct {
 	logger         *slog.Logger
 	httpBaseConfig *http.Server
@@ -329,8 +396,8 @@ type noiseServer struct {
 	derpMap        *tailcfg.DERPMap
 	getIPs         func() []netip.Addr
 
-	peers      *xsync.MapOf[tailcfg.NodeID, *tailcfg.Node]
-	peerUpdate chan update
+	peerStore  *peerStore
+	peerUpdate chan struct{}
 
 	node       *atomic.Pointer[tailcfg.Node]
 	nodeUpdate chan struct{}
@@ -341,7 +408,10 @@ type noiseServer struct {
 }
 
 func (ns *noiseServer) notifyUpdate() {
-	ns.nodeUpdate <- struct{}{}
+	select {
+	case ns.nodeUpdate <- struct{}{}:
+	default:
+	}
 }
 
 func (ns *noiseServer) NoiseRegistrationHandler(w http.ResponseWriter, r *http.Request) {
@@ -362,9 +432,7 @@ func (ns *noiseServer) NoiseRegistrationHandler(w http.ResponseWriter, r *http.R
 	resp.MachineAuthorized = true
 	resp.User = tailcfg.User{
 		ID:          tailcfg.UserID(123),
-		LoginName:   "wgsh",
 		DisplayName: "wgsh",
-		Logins:      []tailcfg.LoginID{},
 		Created:     time.Now(),
 	}
 	resp.Login = tailcfg.Login{
@@ -475,18 +543,8 @@ func (ns *noiseServer) NoisePollNetMapHandler(
 
 }
 
-func (ns *noiseServer) peerMap() []*tailcfg.Node {
-	peers := []*tailcfg.Node{}
-
-	ns.peers.Range(func(key tailcfg.NodeID, value *tailcfg.Node) bool {
-		peers = append(peers, value.Clone())
-		return true
-	})
-	xslices.SortFunc(peers, func(a, b *tailcfg.Node) int {
-		return cmp.Compare(a.ID, b.ID)
-	})
-
-	return peers
+func (ns *noiseServer) peers() []*tailcfg.Node {
+	return ns.peerStore.snapshot()
 }
 
 func (ns *noiseServer) handleStreaming(ctx context.Context, w http.ResponseWriter, req *tailcfg.MapRequest) {
@@ -500,6 +558,11 @@ func (ns *noiseServer) handleStreaming(ctx context.Context, w http.ResponseWrite
 	keepAlive := time.NewTicker(50 * time.Second)
 	defer keepAlive.Stop()
 
+	initialPeers := ns.peers()
+	knownPeerIDs := make(map[tailcfg.NodeID]struct{}, len(initialPeers))
+	for _, peer := range initialPeers {
+		knownPeerIDs[peer.ID] = struct{}{}
+	}
 	res := &tailcfg.MapResponse{
 		KeepAlive:       false,
 		ControlTime:     ptr.To(time.Now()),
@@ -509,7 +572,7 @@ func (ns *noiseServer) handleStreaming(ctx context.Context, w http.ResponseWrite
 		Debug: &tailcfg.Debug{
 			DisableLogTail: true,
 		},
-		Peers:        ns.peerMap(),
+		Peers:        initialPeers,
 		PacketFilter: tailcfg.FilterAllowAll,
 	}
 
@@ -528,16 +591,22 @@ func (ns *noiseServer) handleStreaming(ctx context.Context, w http.ResponseWrite
 		select {
 		case <-ctx.Done():
 			return
-		case upd := <-ns.peerUpdate:
+		case <-ns.peerUpdate:
+			peers := ns.peers()
 			res := &tailcfg.MapResponse{
 				KeepAlive:   false,
 				ControlTime: ptr.To(time.Now()),
+				Peers:       peers,
 			}
-			if upd.ty == updateTypeNewPeer {
-				ns.peers.Store(upd.node.ID, upd.node.Clone())
-				res.Peers = ns.peerMap()
-			} else if upd.ty == updateTypePeerUpdate {
-				res.PeersChangedPatch = []*tailcfg.PeerChange{upd.update}
+			if len(peers) == 0 {
+				for peerID := range knownPeerIDs {
+					res.PeersRemoved = append(res.PeersRemoved, peerID)
+				}
+				slices.Sort(res.PeersRemoved)
+			}
+			knownPeerIDs = make(map[tailcfg.NodeID]struct{}, len(peers))
+			for _, peer := range peers {
+				knownPeerIDs[peer.ID] = struct{}{}
 			}
 
 			err := writeMapResponse(w, req, res)
@@ -607,7 +676,7 @@ func zstdEncode(in []byte) []byte {
 
 var zstdEncoderPool = &sync.Pool{
 	New: func() any {
-		encoder, err := smallzstd.NewEncoder(
+		encoder, err := zstd.NewWriter(
 			nil,
 			zstd.WithEncoderLevel(zstd.SpeedFastest))
 		if err != nil {
@@ -619,17 +688,16 @@ var zstdEncoderPool = &sync.Pool{
 }
 
 func (ns *noiseServer) handleEndpointUpdate(_ http.ResponseWriter, req *tailcfg.MapRequest) {
-	node := ns.getSelfNode()
+	node := ns.getSelfNode().Clone()
 
 	change := peerChange(req, node)
 	change.Online = ptr.To(true)
 	applyPeerChange(node, change)
 
-	_ = ns.storeNode(node)
-
 	sendUpdate, routesChanged := hostInfoChanged(node.Hostinfo.AsStruct(), req.Hostinfo)
 	node.Hostinfo = req.Hostinfo.View()
 	_ = routesChanged
+	_ = ns.storeNode(node)
 
 	if peerChangeEmpty(change) && !sendUpdate {
 		return
@@ -675,7 +743,11 @@ func applyPeerChange(node *tailcfg.Node, change tailcfg.PeerChange) {
 			hf.NetInfo.PreferredDERP = change.DERPRegion
 			node.Hostinfo = hf.View()
 		}
-		node.DERP = fmt.Sprintf("127.3.3.40:%d", change.DERPRegion)
+		node.HomeDERP = change.DERPRegion
+		// Older Tailscale clients only understand the legacy DERP-in-IP:port
+		// field. Emit both representations while mixed protocol versions are
+		// supported.
+		node.LegacyDERPString = net.JoinHostPort(tailcfg.DerpMagicIP, strconv.Itoa(change.DERPRegion))
 	}
 
 	node.LastSeen = change.LastSeen
@@ -750,7 +822,7 @@ func hostInfoChanged(old, new *tailcfg.Hostinfo) (bool, bool) {
 		return comparePrefix(newRoutes[i], newRoutes[j]) > 0
 	})
 
-	if !xslices.Equal(oldRoutes, newRoutes) {
+	if !slices.Equal(oldRoutes, newRoutes) {
 		return true, true
 	}
 

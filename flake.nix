@@ -1,5 +1,5 @@
 {
-  description = "Dev shell for Go backend and React frontend (using pnpm)";
+  description = "Development shell for the tsok CLI";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -15,9 +15,6 @@
         {
           buildInputs = with pkgs; [
             go
-            nodejs
-            pnpm
-            binaryen # wasm-opt
           ];
 
           shellHook = ''

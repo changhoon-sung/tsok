@@ -4,7 +4,6 @@ import (
 	"net/netip"
 
 	"github.com/google/uuid"
-	"github.com/pion/webrtc/v4"
 	"tailscale.com/tailcfg"
 )
 
@@ -14,9 +13,16 @@ type Logf func(format string, args ...any)
 // Tailscale nodes over a sidechannel.
 type Overlay interface {
 	// listenOverlay(ctx context.Context, kind string) error
-	Recv() <-chan *tailcfg.Node
+	Recv() <-chan PeerUpdate
 	SendTailscaleNodeUpdate(node *tailcfg.Node)
 	IPs() []netip.Addr
+}
+
+// PeerUpdate adds or updates an active overlay peer. A nil Node removes it.
+// ID is scoped to the lifetime of the overlay process that emitted the update.
+type PeerUpdate struct {
+	ID   string
+	Node *tailcfg.Node
 }
 
 type messageType int
@@ -27,20 +33,21 @@ const (
 	messageTypeHello
 	messageTypeHelloResponse
 	messageTypeNodeUpdate
-
-	messageTypeWebRTCOffer
-	messageTypeWebRTCAnswer
-	messageTypeWebRTCCandidate
+	messageTypeGoodbye
+	messageTypeOpenUDP
+	messageTypeOpenUDPResponse
 )
 
 type overlayMessage struct {
-	Typ messageType
+	Typ       messageType
+	SessionID string
 
 	HostInfo HostInfo
 	Node     tailcfg.Node
 
-	WebrtcDescription *webrtc.SessionDescription
-	WebrtcCandidate   *webrtc.ICECandidateInit
+	RequestID string
+	UDPPort   uint16
+	Error     string
 }
 
 type HostInfo struct {

@@ -35,13 +35,13 @@ Open a zero-configuration shell:
 WUSH_AUTH_KEY=<auth-key> wush shell
 
 Connect with system OpenSSH:
-WUSH_AUTH_KEY=<auth-key> ssh -o 'ProxyCommand=wush connect --stdio --quiet 127.0.0.1:%p' coder@wush
+WUSH_AUTH_KEY=<auth-key> ssh -o 'ProxyCommand=wush forward --tcp-stdio %p --quiet' coder@wush
 
 Or add this block to ~/.ssh/config:
 Host wush
   HostName wush
   User coder
-  ProxyCommand env WUSH_AUTH_KEY=<auth-key> wush connect --stdio --quiet 127.0.0.1:%p
+  ProxyCommand env WUSH_AUTH_KEY=<auth-key> wush forward --tcp-stdio %p --quiet
 
 ```
 
@@ -60,10 +60,16 @@ coder@colin:~$
 $ WUSH_AUTH_KEY=<auth-key> wush shell -- uname -a
 
 # Or use the system OpenSSH client without a local listening port
-$ WUSH_AUTH_KEY=<auth-key> ssh -o 'ProxyCommand=wush connect --stdio --quiet 127.0.0.1:%p' coder@wush
+$ WUSH_AUTH_KEY=<auth-key> ssh -o 'ProxyCommand=wush forward --tcp-stdio %p --quiet' coder@wush
 
 # After saving the generated block to ~/.ssh/config
 $ ssh wush
+
+# Expose the host's TCP port 8080 on client port 3000
+$ WUSH_AUTH_KEY=<auth-key> wush forward --tcp 3000:8080
+
+# Expose the host's UDP port 53 on client port 5353
+$ WUSH_AUTH_KEY=<auth-key> wush forward --udp 5353:53
 ```
 
 `wush shell` is a zero-configuration remote shell, not a complete OpenSSH
@@ -80,12 +86,14 @@ auth key is a bearer credential for that user's shell privileges.
 | Command | Intended use |
 | --- | --- |
 | `wush shell` | Zero-configuration, one-off shell or remote command |
-| `wush connect --stdio` | General TCP transport over the wush overlay |
+| `wush forward --tcp <local>:<remote>` | Listen locally and forward TCP to the host |
+| `wush forward --udp <local>:<remote>` | Listen locally and forward UDP datagrams to the host |
+| `wush forward --tcp-stdio <remote>` | Bridge one host TCP port to stdin/stdout |
 | System `ssh` | Multiple users and complete OpenSSH features |
 
 The built-in shell does not aim to provide per-user SSH authentication, SFTP,
 agent forwarding, SSH certificates, or SSH port forwarding. Those features
-remain the responsibility of system OpenSSH over `wush connect --stdio`.
+remain the responsibility of system OpenSSH over `wush forward --tcp-stdio`.
 
 Before starting `wush shell`, the client checks its current path. If it is
 already direct, the client reports `Peer connection: direct`. If the peer is
@@ -97,13 +105,25 @@ five seconds. It either reports `Peer connection: direct` or
 back to the relay. `--quiet` suppresses these diagnostics and skips the default
 bounded check unless `--wait-p2p` is also set.
 
-`wush connect --stdio` bridges stdin and stdout to a TCP port on the host's
-loopback interface. This makes it suitable for OpenSSH `ProxyCommand` and other
-clients that support a stdio transport, while keeping features such as agent
-forwarding, port forwarding, `scp`, `rsync`, and IDE SSH integrations in the
-system OpenSSH client. The server's `port-forward` capability, enabled by
-default, must remain enabled. Multiple client processes may use the same wush
-auth key concurrently; stopped processes are removed from the active peer set.
+`wush forward` is the single general-purpose tunnel command. `--tcp` and
+`--udp` create local listeners. A one- or two-port specification binds local
+loopback; a three-field specification can change the local bind address. The
+destination is always the host's loopback interface. `--tcp-stdio` skips the
+local listener and bridges stdin/stdout directly to one host TCP port. This
+makes it suitable for OpenSSH `ProxyCommand` and
+other clients that support a stdio transport, while keeping features such as
+agent forwarding, port forwarding, `scp`, `rsync`, and IDE SSH integrations in
+the system OpenSSH client. Multiple client processes may use the same wush auth
+key concurrently; stopped processes are removed from the active peer set.
+
+TCP destinations are accepted by tsnet's fallback handler and dialed on the
+host loopback interface. UDP has no equivalent fallback handler, so the client
+first sends an authenticated `OpenUDP` request through the encrypted DERP
+overlay. `wush serve` then opens that UDP port inside tsnet for the requesting
+session and forwards its datagrams to the same host loopback port. Repeating a
+request is idempotent, multiple sessions can share a port, and the listener is
+closed after its last requesting session disconnects or expires.
+
 Runtime logs use a consistent timestamp. When a peer establishes a direct
 WireGuard path, `wush serve` reports the peer IP and its UDP endpoint. If a
 direct path is unavailable, it reports the relay region name and code, for
@@ -166,6 +186,41 @@ For a manual installation, see the
 
 ## Technical Details
 
+```mermaid
+flowchart LR
+  subgraph Client
+    CLI["shell / cp / forward"] --> CT["internal/transport Client"]
+  end
+  subgraph Host
+    HT["internal/transport Host"] --> APP["shell, file server, or loopback port"]
+    SERVE["serve"] --> HT
+  end
+  CT <-->|"encrypted bootstrap and control"| DERP["public DERP relay"]
+  DERP <--> HT
+  CT <-->|"WireGuard data: direct UDP or DERP fallback"| HT
+```
+
+For a UDP forward, the small listener request uses the control path before any
+application datagrams use the WireGuard data path:
+
+```mermaid
+sequenceDiagram
+  participant F as wush forward
+  participant C as client transport
+  participant D as DERP
+  participant H as host transport
+  participant U as host loopback UDP
+  F->>C: OpenUDP(remote port)
+  C->>D: encrypted OpenUDP request
+  D->>H: opaque relay packet
+  H->>H: tsnet.Listen("udp", port)
+  H-->>C: encrypted acknowledgement via DERP
+  F->>C: local datagram
+  C->>H: WireGuard data path
+  H->>U: datagram to 127.0.0.1:port
+  U-->>F: response over the reverse path
+```
+
 `wush` doesn't require you to trust any 3rd party authentication or relay
 servers, instead using x25519 keys to authenticate incoming connections. Auth
 keys generated by `wush serve` are separated into a couple parts:
@@ -180,19 +235,23 @@ keys generated by `wush serve` are separated into a couple parts:
 +--------------+----------------+---------------------+------------------+--------------------------+---------------------------+
 ```
 
-Senders and receivers communicate over what we call an "overlay". An overlay
-runs over one of two currently implemented mediums; UDP or DERP. Each message
-over the relay is encrypted with the sender's private key.
+Senders and receivers communicate through an encrypted control overlay over
+DERP. It exchanges WireGuard node information and small runtime requests such
+as opening a UDP forwarding port. DERP treats these as opaque packets; the
+wush endpoints define, encrypt, authenticate, and interpret their contents.
+The receiver only accepts messages encrypted with the private key carried by
+the auth key and addressed to the server's public key.
 
-**UDP**: The receiver creates a NAT holepunch to allow senders to connect
-directly. WireGuard nodes are exchanged peer-to-peer. This mode will only work
-if the receiver doesn't have hard NAT.
+Application traffic then travels inside the resulting WireGuard connection.
+Tailscale's networking stack probes direct UDP paths using the DERP map's STUN
+servers and keeps DERP as the fallback data path when direct connectivity is
+not possible.
 
-**DERP**: The receiver connects to the closest DERP relay server. WireGuard nodes
-are exchanged through the relay.
-
-In both cases auth is handled the same way. The receiver will only accept
-messages encrypted from the sender's private key, to the server's public key.
+The CLI-specific lifecycle is centralized in `internal/transport`: client and
+host setup, the in-memory control server, ephemeral tsnet instance, peer route
+discovery, dialing, and runtime UDP listener leases. Commands only provide
+their application behavior: shell, file transfer, stdio bridging, or local
+TCP/UDP listeners.
 
 ## Why create another file transfer tool?
 

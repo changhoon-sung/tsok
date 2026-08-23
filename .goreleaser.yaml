@@ -19,8 +19,10 @@ builds:
 archives:
   - id: "binaries"
     formats:
-      - binary
+      - tar.gz
     name_template: "{{ .ProjectName }}_{{ .Os }}_{{ .Arch }}"
+    files:
+      - none*
 checksum:
   name_template: "{{ .ProjectName }}_{{ .Version }}_SHA256SUMS"
   algorithm: sha256

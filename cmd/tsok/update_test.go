@@ -51,8 +51,12 @@ func TestUpdateExecutableReplacesBinary(t *testing.T) {
 		t.Fatal(err)
 	}
 	var output bytes.Buffer
-	if err := updateExecutable(t.Context(), server.Client(), server.URL+"/latest", target, "linux", "amd64", "v0.1.1", &output); err != nil {
+	updated, err := updateExecutable(t.Context(), server.Client(), server.URL+"/latest", target, "linux", "amd64", "v0.1.1", &output)
+	if err != nil {
 		t.Fatal(err)
+	}
+	if !updated {
+		t.Fatal("updateExecutable() did not report an update")
 	}
 	got, err := os.ReadFile(target)
 	if err != nil {
@@ -94,7 +98,7 @@ func TestUpdateExecutableRejectsBadChecksum(t *testing.T) {
 	if err := os.WriteFile(target, []byte("old tsok binary"), 0755); err != nil {
 		t.Fatal(err)
 	}
-	err := updateExecutable(t.Context(), server.Client(), server.URL+"/latest", target, "linux", "amd64", "v0.1.1", io.Discard)
+	_, err := updateExecutable(t.Context(), server.Client(), server.URL+"/latest", target, "linux", "amd64", "v0.1.1", io.Discard)
 	if err == nil || !strings.Contains(err.Error(), "checksum mismatch") {
 		t.Fatalf("error = %v, want checksum mismatch", err)
 	}
@@ -121,9 +125,12 @@ func TestUpdateExecutableAlreadyCurrent(t *testing.T) {
 	defer server.Close()
 
 	var output bytes.Buffer
-	err := updateExecutable(t.Context(), server.Client(), server.URL, filepath.Join(t.TempDir(), "tsok"), "darwin", "arm64", "0.1.1", &output)
+	updated, err := updateExecutable(t.Context(), server.Client(), server.URL, filepath.Join(t.TempDir(), "tsok"), "darwin", "arm64", "0.1.1", &output)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if updated {
+		t.Fatal("current version reported an update")
 	}
 	if got := output.String(); got != "tsok v0.1.1 is already up to date\n" {
 		t.Fatalf("output = %q", got)
@@ -139,10 +146,10 @@ func TestRunAutoUpdateAtMostOncePerDay(t *testing.T) {
 		cacheFile:      cacheFile,
 		currentVersion: "v0.1.2",
 		now:            func() time.Time { return now },
-		update: func(_ context.Context, out io.Writer) error {
+		update: func(_ context.Context, out io.Writer) (bool, error) {
 			updateCalls++
 			_, _ = io.WriteString(out, "Updated tsok from v0.1.2 to v0.1.3\n")
-			return nil
+			return true, nil
 		},
 	}
 
@@ -174,9 +181,9 @@ func TestRunAutoUpdateSkipsDevelopmentBuildsAndOptOut(t *testing.T) {
 		cacheFile:      filepath.Join(t.TempDir(), "update-check"),
 		currentVersion: "v0.0.0-devel",
 		now:            time.Now,
-		update: func(context.Context, io.Writer) error {
+		update: func(context.Context, io.Writer) (bool, error) {
 			updateCalls++
-			return nil
+			return true, nil
 		},
 	}
 	t.Setenv("TSOK_NO_AUTO_UPDATE", "")
@@ -197,15 +204,69 @@ func TestRunAutoUpdateFailureDoesNotRepeatImmediately(t *testing.T) {
 		cacheFile:      filepath.Join(t.TempDir(), "update-check"),
 		currentVersion: "v0.1.2",
 		now:            time.Now,
-		update: func(context.Context, io.Writer) error {
+		update: func(context.Context, io.Writer) (bool, error) {
 			updateCalls++
-			return errors.New("network unavailable")
+			return false, errors.New("network unavailable")
 		},
 	}
 	runAutoUpdate(t.Context(), config, io.Discard)
 	runAutoUpdate(t.Context(), config, io.Discard)
 	if updateCalls != 1 {
 		t.Fatalf("update calls = %d, want 1", updateCalls)
+	}
+}
+
+func TestAutoUpdateAndRestart(t *testing.T) {
+	t.Setenv("TSOK_NO_AUTO_UPDATE", "")
+	restartCalls := 0
+	config := autoUpdateConfig{
+		cacheFile:      filepath.Join(t.TempDir(), "update-check"),
+		currentVersion: "v0.1.3",
+		now:            time.Now,
+		update: func(context.Context, io.Writer) (bool, error) {
+			return true, nil
+		},
+		restart: func() error {
+			restartCalls++
+			return nil
+		},
+	}
+	restarted, err := autoUpdateAndRestart(t.Context(), config, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !restarted || restartCalls != 1 {
+		t.Fatalf("restarted = %v, restart calls = %d", restarted, restartCalls)
+	}
+
+	restarted, err = autoUpdateAndRestart(t.Context(), config, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if restarted || restartCalls != 1 {
+		t.Fatalf("cached restarted = %v, restart calls = %d", restarted, restartCalls)
+	}
+}
+
+func TestAutoUpdateRestartFailureReturnsError(t *testing.T) {
+	t.Setenv("TSOK_NO_AUTO_UPDATE", "")
+	config := autoUpdateConfig{
+		cacheFile:      filepath.Join(t.TempDir(), "update-check"),
+		currentVersion: "v0.1.3",
+		now:            time.Now,
+		update: func(context.Context, io.Writer) (bool, error) {
+			return true, nil
+		},
+		restart: func() error {
+			return errors.New("exec denied")
+		},
+	}
+	restarted, err := autoUpdateAndRestart(t.Context(), config, io.Discard)
+	if restarted {
+		t.Fatal("restart failure reported success")
+	}
+	if err == nil || !strings.Contains(err.Error(), "run the command again") {
+		t.Fatalf("error = %v, want rerun guidance", err)
 	}
 }
 

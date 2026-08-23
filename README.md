@@ -41,9 +41,13 @@ the next invocation. The executable's directory must be writable by the
 current user.
 
 The `serve`, `shell`, `cp`, and `forward` commands also perform this update as
-a best-effort check at most once every 24 hours. Update failures never block the
-requested command. Set `TSOK_NO_AUTO_UPDATE=1` to disable automatic updates;
-`tsok update` remains available for an explicit update.
+a best-effort check at most once every 24 hours. Download or validation failures
+never block the requested command. When an update is installed, tsok replaces
+the current process with the new binary and restarts the same command with its
+original arguments and environment. If that restart fails, the command exits
+with an error instead of continuing in the old process. Set
+`TSOK_NO_AUTO_UPDATE=1` to disable automatic updates; `tsok update` remains
+available for an explicit update.
 
 ## Quick start
 

@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/coder/serpent"
@@ -43,29 +44,47 @@ func updateCmd() *serpent.Command {
 		Use:   "update",
 		Short: "Update tsok to the latest release.",
 		Handler: func(inv *serpent.Invocation) error {
-			return updateCurrentExecutable(inv.Context(), getBuildInfo().version, inv.Stdout)
+			_, err := updateCurrentExecutable(inv.Context(), getBuildInfo().version, inv.Stdout)
+			return err
 		},
 		Options: serpent.OptionSet{},
 	}
 }
 
-func updateCurrentExecutable(ctx context.Context, currentVersion string, out io.Writer) error {
+func currentExecutable() (string, error) {
 	executable, err := os.Executable()
 	if err != nil {
-		return fmt.Errorf("locate current executable: %w", err)
+		return "", fmt.Errorf("locate current executable: %w", err)
 	}
 	executable, err = filepath.EvalSymlinks(executable)
 	if err != nil {
-		return fmt.Errorf("resolve current executable: %w", err)
+		return "", fmt.Errorf("resolve current executable: %w", err)
+	}
+	return executable, nil
+}
+
+func updateCurrentExecutable(ctx context.Context, currentVersion string, out io.Writer) (bool, error) {
+	executable, err := currentExecutable()
+	if err != nil {
+		return false, err
 	}
 	return updateExecutable(ctx, http.DefaultClient, latestReleaseURL, executable, runtime.GOOS, runtime.GOARCH, currentVersion, out)
+}
+
+func restartCurrentExecutable() error {
+	executable, err := currentExecutable()
+	if err != nil {
+		return err
+	}
+	return syscall.Exec(executable, os.Args, os.Environ())
 }
 
 type autoUpdateConfig struct {
 	cacheFile      string
 	currentVersion string
 	now            func() time.Time
-	update         func(context.Context, io.Writer) error
+	update         func(context.Context, io.Writer) (bool, error)
+	restart        func() error
 }
 
 func withAutoUpdate(command *serpent.Command) *serpent.Command {
@@ -82,9 +101,10 @@ func defaultAutoUpdateConfig() autoUpdateConfig {
 	config := autoUpdateConfig{
 		currentVersion: getBuildInfo().version,
 		now:            time.Now,
-		update: func(ctx context.Context, out io.Writer) error {
+		update: func(ctx context.Context, out io.Writer) (bool, error) {
 			return updateCurrentExecutable(ctx, getBuildInfo().version, out)
 		},
+		restart: restartCurrentExecutable,
 	}
 	if cacheDir, err := os.UserCacheDir(); err == nil {
 		config.cacheFile = filepath.Join(cacheDir, "tsok", "update-check")
@@ -95,30 +115,50 @@ func defaultAutoUpdateConfig() autoUpdateConfig {
 func autoUpdateMiddleware(config autoUpdateConfig) serpent.MiddlewareFunc {
 	return func(next serpent.HandlerFunc) serpent.HandlerFunc {
 		return func(inv *serpent.Invocation) error {
-			var output strings.Builder
-			runAutoUpdate(inv.Context(), config, &output)
-			if inv.Stderr != nil && strings.HasPrefix(output.String(), "Updated ") {
-				_, _ = io.WriteString(inv.Stderr, output.String())
+			output := inv.Stderr
+			if output == nil {
+				output = io.Discard
+			}
+			restarted, err := autoUpdateAndRestart(inv.Context(), config, output)
+			if err != nil {
+				return err
+			}
+			if restarted {
+				return nil
 			}
 			return next(inv)
 		}
 	}
 }
 
-func runAutoUpdate(ctx context.Context, config autoUpdateConfig, out io.Writer) {
+func autoUpdateAndRestart(ctx context.Context, config autoUpdateConfig, out io.Writer) (bool, error) {
+	if !runAutoUpdate(ctx, config, out) {
+		return false, nil
+	}
+	if config.restart == nil {
+		return false, errors.New("automatic update installed, but restart is unavailable; run the command again")
+	}
+	if err := config.restart(); err != nil {
+		return false, fmt.Errorf("automatic update installed, but restarting tsok failed: %w; run the command again", err)
+	}
+	return true, nil
+}
+
+func runAutoUpdate(ctx context.Context, config autoUpdateConfig, out io.Writer) bool {
 	if config.cacheFile == "" || config.now == nil || config.update == nil || isDevelopmentVersion(config.currentVersion) || os.Getenv("TSOK_NO_AUTO_UPDATE") != "" {
-		return
+		return false
 	}
 	now := config.now()
 	if !autoUpdateDue(config.cacheFile, now) {
-		return
+		return false
 	}
 	if err := recordAutoUpdateCheck(config.cacheFile, now); err != nil {
-		return
+		return false
 	}
 	updateCtx, cancel := context.WithTimeout(ctx, autoUpdateTimeout)
 	defer cancel()
-	_ = config.update(updateCtx, out)
+	updated, err := config.update(updateCtx, out)
+	return err == nil && updated
 }
 
 func autoUpdateDue(path string, now time.Time) bool {
@@ -145,24 +185,24 @@ func isDevelopmentVersion(value string) bool {
 	return value == "" || value == "dev" || strings.Contains(value, "devel")
 }
 
-func updateExecutable(ctx context.Context, client *http.Client, releaseURL, executable, goos, goarch, currentVersion string, out io.Writer) error {
+func updateExecutable(ctx context.Context, client *http.Client, releaseURL, executable, goos, goarch, currentVersion string, out io.Writer) (bool, error) {
 	if goos != "linux" && goos != "darwin" {
-		return fmt.Errorf("unsupported OS: %s", goos)
+		return false, fmt.Errorf("unsupported OS: %s", goos)
 	}
 	if goarch != "amd64" && goarch != "arm64" {
-		return fmt.Errorf("unsupported architecture: %s", goarch)
+		return false, fmt.Errorf("unsupported architecture: %s", goarch)
 	}
 
 	release, err := fetchRelease(ctx, client, releaseURL)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if release.TagName == "" {
-		return errors.New("latest release has no tag")
+		return false, errors.New("latest release has no tag")
 	}
 	if normalizeVersion(currentVersion) == normalizeVersion(release.TagName) {
 		_, _ = fmt.Fprintf(out, "tsok %s is already up to date\n", release.TagName)
-		return nil
+		return false, nil
 	}
 
 	archiveName := fmt.Sprintf("tsok_%s_%s.tar.gz", goos, goarch)
@@ -177,63 +217,63 @@ func updateExecutable(ctx context.Context, client *http.Client, releaseURL, exec
 		}
 	}
 	if archiveURL == "" {
-		return fmt.Errorf("release %s has no %s asset", release.TagName, archiveName)
+		return false, fmt.Errorf("release %s has no %s asset", release.TagName, archiveName)
 	}
 	if checksumURL == "" {
-		return fmt.Errorf("release %s has no %s asset", release.TagName, checksumName)
+		return false, fmt.Errorf("release %s has no %s asset", release.TagName, checksumName)
 	}
 
 	targetDir := filepath.Dir(executable)
 	archive, err := os.CreateTemp(targetDir, ".tsok-update-*.tar.gz")
 	if err != nil {
-		return fmt.Errorf("create update file beside executable: %w", err)
+		return false, fmt.Errorf("create update file beside executable: %w", err)
 	}
 	archivePath := archive.Name()
 	defer os.Remove(archivePath)
 
 	if err := downloadTo(ctx, client, archiveURL, archive, maxArchiveSize); err != nil {
 		archive.Close()
-		return fmt.Errorf("download %s: %w", archiveName, err)
+		return false, fmt.Errorf("download %s: %w", archiveName, err)
 	}
 	if err := archive.Close(); err != nil {
-		return fmt.Errorf("close downloaded archive: %w", err)
+		return false, fmt.Errorf("close downloaded archive: %w", err)
 	}
 
 	checksums, err := downloadBytes(ctx, client, checksumURL, maxChecksumSize)
 	if err != nil {
-		return fmt.Errorf("download %s: %w", checksumName, err)
+		return false, fmt.Errorf("download %s: %w", checksumName, err)
 	}
 	if err := verifyArchive(archivePath, archiveName, checksums); err != nil {
-		return err
+		return false, err
 	}
 
 	replacement, err := os.CreateTemp(targetDir, ".tsok-update-*")
 	if err != nil {
-		return fmt.Errorf("create replacement executable: %w", err)
+		return false, fmt.Errorf("create replacement executable: %w", err)
 	}
 	replacementPath := replacement.Name()
 	defer os.Remove(replacementPath)
 	if err := extractExecutable(archivePath, replacement); err != nil {
 		replacement.Close()
-		return err
+		return false, err
 	}
 	if err := replacement.Chmod(0755); err != nil {
 		replacement.Close()
-		return fmt.Errorf("set replacement permissions: %w", err)
+		return false, fmt.Errorf("set replacement permissions: %w", err)
 	}
 	if err := replacement.Sync(); err != nil {
 		replacement.Close()
-		return fmt.Errorf("sync replacement executable: %w", err)
+		return false, fmt.Errorf("sync replacement executable: %w", err)
 	}
 	if err := replacement.Close(); err != nil {
-		return fmt.Errorf("close replacement executable: %w", err)
+		return false, fmt.Errorf("close replacement executable: %w", err)
 	}
 	if err := os.Rename(replacementPath, executable); err != nil {
-		return fmt.Errorf("replace current executable: %w", err)
+		return false, fmt.Errorf("replace current executable: %w", err)
 	}
 
 	_, _ = fmt.Fprintf(out, "Updated tsok from %s to %s\n", currentVersion, release.TagName)
-	return nil
+	return true, nil
 }
 
 func fetchRelease(ctx context.Context, client *http.Client, url string) (releaseInfo, error) {

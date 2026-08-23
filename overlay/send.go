@@ -15,7 +15,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/coder/wush/cliui"
 	"github.com/google/uuid"
 	"tailscale.com/derp"
 	"tailscale.com/derp/derphttp"
@@ -53,6 +52,51 @@ type Send struct {
 	closeFunc func()
 	closed    bool
 	done      chan struct{}
+
+	requestMu sync.Mutex
+	requests  map[string]chan error
+}
+
+func (s *Send) OpenUDP(ctx context.Context, port uint16) error {
+	if port == 0 {
+		return errors.New("UDP port cannot be zero")
+	}
+	requestID := uuid.NewString()
+	result := make(chan error, 1)
+	s.requestMu.Lock()
+	if s.requests == nil {
+		s.requests = make(map[string]chan error)
+	}
+	s.requests[requestID] = result
+	s.requestMu.Unlock()
+	defer func() {
+		s.requestMu.Lock()
+		delete(s.requests, requestID)
+		s.requestMu.Unlock()
+	}()
+
+	msg := &overlayMessage{
+		Typ:       messageTypeOpenUDP,
+		SessionID: s.SessionID,
+		RequestID: requestID,
+		UDPPort:   port,
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-s.done:
+		return errors.New("overlay closed")
+	case s.out <- msg:
+	}
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-s.done:
+		return errors.New("overlay closed")
+	case err := <-result:
+		return err
+	}
 }
 
 func (s *Send) IPs() []netip.Addr {
@@ -123,7 +167,7 @@ func (s *Send) ListenOverlayDERP(ctx context.Context) error {
 				sealed := s.Auth.OverlayPrivateKey.SealTo(s.Auth.ReceiverPublicKey, raw)
 				err = c.Send(s.Auth.ReceiverPublicKey, sealed)
 				if err != nil {
-					fmt.Printf("send response over derp: %s\n", err)
+					s.Logger.Error("send overlay message over DERP", "err", err)
 					return
 				}
 			case <-keepAlive.C:
@@ -147,20 +191,20 @@ func (s *Send) ListenOverlayDERP(ctx context.Context) error {
 		switch msg := msg.(type) {
 		case derp.ReceivedPacket:
 			if s.Auth.ReceiverPublicKey != msg.Source {
-				fmt.Printf("message from unknown peer %s\n", msg.Source.String())
+				s.Logger.Warn("received overlay message from unknown peer", "peer", msg.Source.String())
 				continue
 			}
 
 			res, err := s.handleNextMessage(msg.Data)
 			if err != nil {
-				fmt.Println("Failed to handle overlay message", err)
+				s.Logger.Error("handle overlay message", "err", err)
 				continue
 			}
 
 			if res != nil {
 				err = c.Send(msg.Source, res)
 				if err != nil {
-					fmt.Println(cliui.Timestamp(time.Now()), "Failed to send overlay response over derp:", err.Error())
+					s.Logger.Error("send overlay response over DERP", "err", err)
 					return err
 				}
 			}
@@ -224,6 +268,26 @@ func (s *Send) handleNextMessage(msg []byte) (resRaw []byte, _ error) {
 		s.in <- PeerUpdate{ID: s.Auth.ReceiverPublicKey.String(), Node: ovMsg.Node.Clone()}
 	case messageTypeNodeUpdate:
 		s.in <- PeerUpdate{ID: s.Auth.ReceiverPublicKey.String(), Node: ovMsg.Node.Clone()}
+	case messageTypeOpenUDPResponse:
+		if ovMsg.RequestID == "" {
+			return nil, errors.New("UDP response has no request ID")
+		}
+		s.requestMu.Lock()
+		request := s.requests[ovMsg.RequestID]
+		s.requestMu.Unlock()
+		if request == nil {
+			return nil, errors.New("UDP response has unknown request ID")
+		}
+		var responseErr error
+		if ovMsg.Error != "" {
+			responseErr = errors.New(ovMsg.Error)
+		}
+		select {
+		case request <- responseErr:
+		default:
+		}
+	default:
+		return nil, fmt.Errorf("unsupported overlay message type %d", ovMsg.Typ)
 	}
 
 	if res.Typ == 0 {

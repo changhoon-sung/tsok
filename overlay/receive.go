@@ -77,10 +77,35 @@ type Receive struct {
 	peerMu   sync.Mutex
 	peers    map[string]receivePeer
 	reapOnce sync.Once
+
+	handlerMu            sync.RWMutex
+	openUDPHandler       func(sessionID string, port uint16) error
+	sessionClosedHandler func(sessionID string)
 	// in funnels node updates from other peers to us
 	in chan PeerUpdate
 	// out fans out our node updates to peers
 	out chan *overlayMessage
+}
+
+func (r *Receive) SetOpenUDPHandler(handler func(sessionID string, port uint16) error) {
+	r.handlerMu.Lock()
+	r.openUDPHandler = handler
+	r.handlerMu.Unlock()
+}
+
+func (r *Receive) SetSessionClosedHandler(handler func(sessionID string)) {
+	r.handlerMu.Lock()
+	r.sessionClosedHandler = handler
+	r.handlerMu.Unlock()
+}
+
+func (r *Receive) notifySessionClosed(sessionID string) {
+	r.handlerMu.RLock()
+	handler := r.sessionClosedHandler
+	r.handlerMu.RUnlock()
+	if handler != nil {
+		handler(sessionID)
+	}
 }
 
 func (r *Receive) IPs() []netip.Addr {
@@ -225,6 +250,7 @@ func (r *Receive) handleNextMessage(source peerSource, msg []byte, system string
 		return nil, err
 	}
 	if removed {
+		r.notifySessionClosed(ovMsg.SessionID)
 		return nil, nil
 	}
 
@@ -256,6 +282,30 @@ func (r *Receive) handleNextMessage(source peerSource, msg []byte, system string
 		if lastNode := r.lastNode.Load(); lastNode != nil {
 			res.Node = *lastNode
 		}
+	case messageTypeOpenUDP:
+		res.Typ = messageTypeOpenUDPResponse
+		res.RequestID = ovMsg.RequestID
+		res.UDPPort = ovMsg.UDPPort
+		if ovMsg.RequestID == "" {
+			res.Error = "UDP request has no request ID"
+			break
+		}
+		if ovMsg.UDPPort == 0 {
+			res.Error = "UDP port cannot be zero"
+			break
+		}
+		r.handlerMu.RLock()
+		handler := r.openUDPHandler
+		r.handlerMu.RUnlock()
+		if handler == nil {
+			res.Error = "UDP forwarding is disabled"
+			break
+		}
+		if err := handler(ovMsg.SessionID, ovMsg.UDPPort); err != nil {
+			res.Error = err.Error()
+		}
+	default:
+		return nil, fmt.Errorf("unsupported overlay message type %d", ovMsg.Typ)
 
 	}
 
@@ -314,26 +364,36 @@ func (r *Receive) derpPeers() []derpPeer {
 }
 
 func (r *Receive) removeDERPPeers(peerKey key.NodePublic) {
+	var removed []string
 	r.peerMu.Lock()
 	for sessionID, peer := range r.peers {
 		if peer.source.derpKey == peerKey {
 			delete(r.peers, sessionID)
 			r.in <- PeerUpdate{ID: sessionID}
+			removed = append(removed, sessionID)
 		}
 	}
 	r.peerMu.Unlock()
+	for _, sessionID := range removed {
+		r.notifySessionClosed(sessionID)
+	}
 }
 
 func (r *Receive) expirePeers(now time.Time) {
 	cutoff := now.Add(-peerInactiveTimeout)
+	var removed []string
 	r.peerMu.Lock()
 	for sessionID, peer := range r.peers {
 		if !peer.lastSeen.After(cutoff) {
 			delete(r.peers, sessionID)
 			r.in <- PeerUpdate{ID: sessionID}
+			removed = append(removed, sessionID)
 		}
 	}
 	r.peerMu.Unlock()
+	for _, sessionID := range removed {
+		r.notifySessionClosed(sessionID)
+	}
 }
 
 func (r *Receive) startPeerReaper(ctx context.Context) {

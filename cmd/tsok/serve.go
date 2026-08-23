@@ -93,8 +93,8 @@ func serveCmd() *serpent.Command {
 				plainf("\n%s", cliui.Bold("Your auth key is:"))
 				fmt.Println("  >", cliui.Code(authKey))
 				plainf("Use this key to authenticate other tsok commands to this instance.")
-				if shellEnabled || forwardEnabled {
-					plainf("\n%s", serveConnectionHelp(authKey, serveUsername(), shellEnabled, forwardEnabled))
+				if forwardEnabled {
+					plainf("\n%s", serveConnectionHelp(authKey, serveUsername(), forwardEnabled))
 				}
 			} else {
 				fmt.Println(cliui.Code(authKey))
@@ -348,39 +348,31 @@ func serveUsername() string {
 	return "user"
 }
 
-func serveConnectionHelp(authKey, username string, shellEnabled, forwardEnabled bool) string {
-	authAssignment := "TSOK_AUTH_KEY=" + authKey
-	sections := make([]string, 0, 3)
-	if shellEnabled {
-		sections = append(sections, fmt.Sprintf("%s\n%s tsok shell",
-			cliui.Bold("Open a zero-configuration shell:"), authAssignment))
-	}
+func serveConnectionHelp(authKey, username string, forwardEnabled bool) string {
 	if !forwardEnabled {
-		if len(sections) == 0 {
-			return ""
-		}
-		return strings.Join(sections, "\n\n") + "\n"
+		return ""
 	}
 
+	authAssignment := "TSOK_AUTH_KEY=" + authKey
 	proxyOption := "'ProxyCommand=tsok forward --tcp-stdio %p --quiet'"
 	command := fmt.Sprintf("%s ssh -o %s %s@tsok", authAssignment, proxyOption, username)
 	proxyCommand := fmt.Sprintf("env %s tsok forward --tcp-stdio %%p --quiet", authAssignment)
-	sections = append(sections, fmt.Sprintf(`%s
+	configBlock := fmt.Sprintf(`Host tsok
+  HostName tsok
+  User %s
+  ProxyCommand %s`, username, proxyCommand)
+	return fmt.Sprintf(`%s
 %s
 
 %s
+
 %s
-  HostName tsok
-  User %s
-  %s %s`,
+`,
 		cliui.Bold("Connect with system OpenSSH:"),
 		command,
 		cliui.Bold("Or add this block to ~/.ssh/config:"),
-		cliui.Bold("Host tsok"),
-		username,
-		"ProxyCommand", proxyCommand,
-	))
-	return strings.Join(sections, "\n\n") + "\n"
+		cliui.ConfigBlock(configBlock),
+	)
 }
 
 func bicopy(ctx context.Context, c1, c2 io.ReadWriteCloser) {

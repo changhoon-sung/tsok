@@ -182,14 +182,12 @@ func TestBridgeStdioCancellation(t *testing.T) {
 func TestServeConnectionHelp(t *testing.T) {
 	t.Parallel()
 
-	got := serveConnectionHelp("test-auth-key", "alice", true, true)
-	want := `Open a zero-configuration shell:
-TSOK_AUTH_KEY=test-auth-key tsok shell
-
-Connect with system OpenSSH:
+	got := serveConnectionHelp("test-auth-key", "alice", true)
+	want := `Connect with system OpenSSH:
 TSOK_AUTH_KEY=test-auth-key ssh -o 'ProxyCommand=tsok forward --tcp-stdio %p --quiet' alice@tsok
 
 Or add this block to ~/.ssh/config:
+
 Host tsok
   HostName tsok
   User alice
@@ -205,15 +203,13 @@ Host tsok
 		t.Fatal("connection help passes the auth key in argv")
 	}
 
-	shellOnly := serveConnectionHelp("test-auth-key", "alice", true, false)
-	if want := "Open a zero-configuration shell:\nTSOK_AUTH_KEY=test-auth-key tsok shell\n"; shellOnly != want {
-		t.Fatalf("shell-only help = %q, want %q", shellOnly, want)
+	if strings.Contains(got, "zero-configuration shell") || strings.Contains(got, "tsok shell") {
+		t.Fatalf("connection help contains built-in shell guidance: %q", got)
 	}
-	openSSHOnly := serveConnectionHelp("test-auth-key", "alice", false, true)
-	if strings.Contains(openSSHOnly, "tsok shell") || !strings.Contains(openSSHOnly, "Connect with system OpenSSH:") {
-		t.Fatalf("OpenSSH-only help contains unexpected routes: %q", openSSHOnly)
+	if !strings.Contains(got, "config:\n\nHost tsok") {
+		t.Fatalf("connection help does not separate the config block: %q", got)
 	}
-	if got := serveConnectionHelp("test-auth-key", "alice", false, false); got != "" {
+	if got := serveConnectionHelp("test-auth-key", "alice", false); got != "" {
 		t.Fatalf("disabled connection help = %q, want empty", got)
 	}
 }

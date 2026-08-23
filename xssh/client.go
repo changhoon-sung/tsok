@@ -3,6 +3,7 @@ package xssh
 import (
 	"context"
 	"fmt"
+	"net"
 	"os"
 	"strings"
 
@@ -10,27 +11,15 @@ import (
 	"github.com/muesli/termenv"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/term"
-	"tailscale.com/tsnet"
 )
 
-func TailnetSSH(ctx context.Context, inv *serpent.Invocation, ts *tsnet.Server, addr string, stdio bool) error {
+func SSH(ctx context.Context, inv *serpent.Invocation, conn net.Conn) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	conn, err := ts.Dial(ctx, "tcp", addr)
-	if err != nil {
-		return err
-	}
 	defer conn.Close()
 	stopClose := context.AfterFunc(ctx, func() { _ = conn.Close() })
 	defer stopClose()
-
-	// if stdio {
-	// 	gnConn, ok := conn.(*gonet.TCPConn)
-	// 	if !ok {
-	// 		panic("ssh tcp conn is not *gonet.TCPConn")
-	// 	}
-	// }
 
 	sshConn, channels, requests, err := ssh.NewClientConn(conn, "127.0.0.1:22", &ssh.ClientConfig{
 		HostKeyCallback: ssh.InsecureIgnoreHostKey(),

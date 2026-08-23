@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/netip"
@@ -14,111 +15,95 @@ import (
 	"sync"
 
 	"tailscale.com/tailcfg"
-	"tailscale.com/tsnet"
-	"tailscale.com/types/ptr"
 
 	"github.com/coder/serpent"
 	"github.com/coder/wush/cliui"
-	"github.com/coder/wush/overlay"
-	"github.com/coder/wush/tsserver"
+	transportcore "github.com/coder/wush/internal/transport"
 )
 
-func portForwardCmd() *serpent.Command {
+func forwardCmd() *serpent.Command {
 	var (
-		verbose   bool
-		derpmapFi string
-		logger    = new(slog.Logger)
-		logf      = func(str string, args ...any) {}
+		verbose    bool
+		quiet      bool
+		derpmapFi  string
+		tcpStdio   string
+		logger     = new(slog.Logger)
+		logf       = func(str string, args ...any) {}
+		waitDirect bool
 
-		dm          = new(tailcfg.DERPMap)
-		overlayOpts = new(sendOverlayOpts)
-		send        = new(overlay.Send)
+		dm          *tailcfg.DERPMap
+		authKey     string
 		tcpForwards []string // <port>:<port>
 		udpForwards []string // <port>:<port>
 	)
 	return &serpent.Command{
-		Use:   "port-forward",
-		Short: "Forward ports from the wush server.",
+		Use:   "forward",
+		Short: "Forward local endpoints to ports on the wush server.",
 		Long: formatExamples(
 			example{
-				Description: "Forward a single TCP port from 1234 on the server to port 5678 on your local machine",
-				Command:     "wush port-forward --tcp 5678:1234",
+				Description: "Forward host TCP port 1234 to local port 5678",
+				Command:     "wush forward --tcp 5678:1234",
 			},
 			example{
 				Description: "Forward a single UDP port",
-				Command:     "wush port-forward --udp 9000",
+				Command:     "wush forward --udp 9000",
+			},
+			example{
+				Description: "Forward stdin and stdout to a TCP port for OpenSSH ProxyCommand",
+				Command:     "wush forward --tcp-stdio 22",
 			},
 			example{
 				Description: "Forward multiple TCP ports and a UDP port",
-				Command:     "wush port-forward --tcp 8080:8080 --tcp 9000:3000 --udp 5353:53",
-			},
-			example{
-				Description: "Forward multiple ports (TCP or UDP) in condensed syntax",
-				Command:     "wush port-forward --tcp 8080,9000:3000,9090-9092,10000-10002:10010-10012",
+				Command:     "wush forward --tcp 8080:8080 --tcp 9000:3000 --udp 5353:53",
 			},
 			example{
 				Description: "Forward specifying the local address to bind",
-				Command:     "wush port-forward --tcp 1.2.3.4:8080:8080",
+				Command:     "wush forward --tcp 1.2.3.4:8080:8080",
 			},
 		),
 		Middleware: serpent.Chain(
-			initLogger(&verbose, ptr.To(false), logger, &logf),
-			initAuth(&overlayOpts.authKey, &overlayOpts.clientAuth),
-			derpMap(&derpmapFi, dm),
-			sendOverlayMW(overlayOpts, &send, logger, dm, &logf),
+			initLogger(&verbose, &quiet, logger, &logf),
+			initAuth(&authKey),
+			derpMap(&derpmapFi, &dm),
 		),
 		Handler: func(inv *serpent.Invocation) error {
 			ctx, cancel := context.WithCancel(inv.Context())
 			defer cancel()
+			if tcpStdio != "" && (len(tcpForwards) != 0 || len(udpForwards) != 0) {
+				return errors.New("--tcp-stdio cannot be combined with --tcp or --udp")
+			}
+			var stdioPort uint16
+			if tcpStdio != "" {
+				parsed, err := parsePort(tcpStdio)
+				if err != nil {
+					return fmt.Errorf("parse --tcp-stdio port: %w", err)
+				}
+				stdioPort = parsed
+			}
 
 			specs, err := parsePortForwards(tcpForwards, udpForwards)
 			if err != nil {
-				return fmt.Errorf("parse port-forward specs: %w", err)
+				return fmt.Errorf("parse forward specs: %w", err)
 			}
-			if len(specs) == 0 {
-				return errors.New("no port-forwards requested")
+			if len(specs) == 0 && stdioPort == 0 {
+				return errors.New("no forwards requested")
 			}
 
-			s, err := tsserver.NewServer(ctx, logger, send, dm)
+			client, err := connectTransport(ctx, clientTransportOptions{
+				authKey: authKey, waitP2P: waitDirect, derpMap: dm,
+				verbose: verbose, logger: logger, logf: logf, logWriter: inv.Stderr,
+			})
 			if err != nil {
 				return err
 			}
-			defer s.Close()
+			defer client.Close()
 
-			go send.ListenOverlayDERP(ctx)
-
-			go func() {
-				if err := s.ListenAndServe(ctx); err != nil {
-					logger.Error("local control server stopped", "err", err)
-				}
-			}()
-			ts, err := newTSNet("send", verbose, s.ControlURL())
-			if err != nil {
-				return err
-			}
-			defer ts.Close()
-
-			logf("Bringing WireGuard up..")
-			if _, err := ts.Up(ctx); err != nil {
-				return fmt.Errorf("bring wireguard up: %w", err)
-			}
-			logf("WireGuard is ready!")
-
-			lc, err := ts.LocalClient()
-			if err != nil {
-				return err
-			}
-
-			ip, err := waitUntilHasPeerHasIP(ctx, logf, lc)
-			if err != nil {
-				return err
-			}
-
-			if overlayOpts.waitP2P {
-				err := waitUntilHasP2P(ctx, logf, lc)
+			if stdioPort != 0 {
+				conn, err := client.DialTCP(ctx, stdioPort)
 				if err != nil {
-					return err
+					return fmt.Errorf("dial TCP port %d in peer: %w", stdioPort, err)
 				}
+				return bridgeStdio(ctx, conn, inv.Stdin, inv.Stdout)
 			}
 
 			var (
@@ -137,7 +122,12 @@ func portForwardCmd() *serpent.Command {
 			defer closeAllListeners()
 
 			for i, spec := range specs {
-				l, err := listenAndPortForward(ctx, inv, ts, ip, wg, spec, logger)
+				if spec.dialNetwork == "udp" {
+					if err := client.OpenUDP(ctx, spec.dialAddress.Port()); err != nil {
+						return fmt.Errorf("open UDP port %d in peer: %w", spec.dialAddress.Port(), err)
+					}
+				}
+				l, err := listenAndForward(ctx, inv, client, wg, spec, logger)
 				if err != nil {
 					logger.Error("failed to listen", "spec", spec, "err", err)
 					return err
@@ -154,6 +144,7 @@ func portForwardCmd() *serpent.Command {
 
 				sigs := make(chan os.Signal, 1)
 				signal.Notify(sigs, os.Interrupt)
+				defer signal.Stop(sigs)
 
 				select {
 				case <-ctx.Done():
@@ -177,7 +168,7 @@ func portForwardCmd() *serpent.Command {
 				Env:         "WUSH_AUTH_KEY",
 				Description: "The auth key returned by " + cliui.Code("wush serve") + ". If not provided, it will be asked for on startup.",
 				Default:     "",
-				Value:       serpent.StringOf(&overlayOpts.authKey),
+				Value:       serpent.StringOf(&authKey),
 			},
 			{
 				Flag:        "derp-config-file",
@@ -189,7 +180,7 @@ func portForwardCmd() *serpent.Command {
 				Flag:        "wait-p2p",
 				Description: waitDirectDescription,
 				Default:     "false",
-				Value:       serpent.BoolOf(&overlayOpts.waitP2P),
+				Value:       serpent.BoolOf(&waitDirect),
 			},
 			{
 				Flag:          "verbose",
@@ -201,25 +192,36 @@ func portForwardCmd() *serpent.Command {
 			{
 				Flag:          "tcp",
 				FlagShorthand: "p",
-				Env:           "WUSH_PORT_FORWARD_TCP",
+				Env:           "WUSH_FORWARD_TCP",
 				Description:   "Forward TCP port(s) from the peer to the local machine.",
 				Value:         serpent.StringArrayOf(&tcpForwards),
 			},
 			{
 				Flag:        "udp",
-				Env:         "WUSH_PORT_FORWARD_UDP",
+				Env:         "WUSH_FORWARD_UDP",
 				Description: "Forward UDP port(s) from the peer to the local machine. The UDP connection has TCP-like semantics to support stateful UDP protocols.",
 				Value:       serpent.StringArrayOf(&udpForwards),
+			},
+			{
+				Flag:        "tcp-stdio",
+				Description: "Forward stdin and stdout to one TCP port on the peer.",
+				Default:     "",
+				Value:       serpent.StringOf(&tcpStdio),
+			},
+			{
+				Flag:        "quiet",
+				Description: "Silences diagnostic output.",
+				Default:     "false",
+				Value:       serpent.BoolOf(&quiet),
 			},
 		},
 	}
 }
 
-func listenAndPortForward(
+func listenAndForward(
 	ctx context.Context,
 	inv *serpent.Invocation,
-	ts *tsnet.Server,
-	remoteIP netip.Addr,
+	client *transportcore.Client,
 	wg *sync.WaitGroup,
 	spec portForwardSpec,
 	logger *slog.Logger,
@@ -239,8 +241,9 @@ func listenAndPortForward(
 		for {
 			netConn, err := l.Accept()
 			if err != nil {
-				// Silently ignore net.ErrClosed errors.
-				if errors.Is(err, net.ErrClosed) {
+				// Listener implementations do not all wrap net.ErrClosed. Context
+				// cancellation is the authoritative signal for a normal shutdown.
+				if ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
 					logger.Debug("listener closed")
 					return
 				}
@@ -252,22 +255,101 @@ func listenAndPortForward(
 
 			go func(netConn net.Conn) {
 				defer netConn.Close()
-				addr := netip.AddrPortFrom(remoteIP, spec.dialAddress.Port())
-				remoteConn, err := ts.Dial(ctx, spec.dialNetwork, addr.String())
+				remoteConn, err := client.Dial(ctx, spec.dialNetwork, spec.dialAddress.Port())
 				if err != nil {
-					_, _ = fmt.Fprintf(inv.Stderr, "Failed to dial '%v://%v' in peer: %s\n", spec.dialNetwork, addr, err)
+					_, _ = fmt.Fprintf(inv.Stderr, "Failed to dial '%v://%v' in peer: %s\n", spec.dialNetwork, spec.dialAddress, err)
 					return
 				}
 				defer remoteConn.Close()
 				logger.Debug("dialed remote", "remote_addr", netConn.RemoteAddr())
 
-				bicopy(ctx, netConn, remoteConn)
+				if spec.dialNetwork == "udp" {
+					copyDatagrams(ctx, netConn, remoteConn)
+				} else {
+					bicopy(ctx, netConn, remoteConn)
+				}
 				logger.Debug("connection closing", "remote_addr", netConn.RemoteAddr())
 			}(netConn)
 		}
 	}(spec)
 
 	return l, nil
+}
+
+func bridgeStdio(ctx context.Context, conn net.Conn, stdin io.Reader, stdout io.Writer) error {
+	defer conn.Close()
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = conn.Close()
+		case <-done:
+		}
+	}()
+
+	stdinErr := make(chan error, 1)
+	go func() {
+		_, err := io.Copy(conn, stdin)
+		if err == nil {
+			if closeWriter, ok := conn.(interface{ CloseWrite() error }); ok {
+				err = closeWriter.CloseWrite()
+			}
+		}
+		stdinErr <- err
+		if err != nil {
+			_ = conn.Close()
+		}
+	}()
+
+	_, stdoutErr := io.Copy(stdout, conn)
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	select {
+	case err := <-stdinErr:
+		if err != nil {
+			return fmt.Errorf("copy stdin to remote connection: %w", err)
+		}
+	default:
+	}
+	if stdoutErr != nil {
+		return fmt.Errorf("copy remote connection to stdout: %w", stdoutErr)
+	}
+	return nil
+}
+
+func copyDatagrams(ctx context.Context, left, right net.Conn) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	defer left.Close()
+	defer right.Close()
+
+	var wg sync.WaitGroup
+	copyOne := func(dst, src net.Conn) {
+		defer wg.Done()
+		buf := make([]byte, 65535)
+		for {
+			n, err := src.Read(buf)
+			if err != nil {
+				cancel()
+				return
+			}
+			if _, err := dst.Write(buf[:n]); err != nil {
+				cancel()
+				return
+			}
+		}
+	}
+	wg.Add(2)
+	go copyOne(left, right)
+	go copyOne(right, left)
+	done := make(chan struct{})
+	go func() { wg.Wait(); close(done) }()
+	select {
+	case <-ctx.Done():
+	case <-done:
+	}
 }
 
 type portForwardSpec struct {

@@ -4,9 +4,11 @@ import (
 	"archive/tar"
 	"bytes"
 	"compress/gzip"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -15,6 +17,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestUpdateExecutableReplacesBinary(t *testing.T) {
@@ -124,6 +127,85 @@ func TestUpdateExecutableAlreadyCurrent(t *testing.T) {
 	}
 	if got := output.String(); got != "tsok v0.1.1 is already up to date\n" {
 		t.Fatalf("output = %q", got)
+	}
+}
+
+func TestRunAutoUpdateAtMostOncePerDay(t *testing.T) {
+	t.Setenv("TSOK_NO_AUTO_UPDATE", "")
+	now := time.Date(2026, time.August, 23, 12, 0, 0, 0, time.UTC)
+	updateCalls := 0
+	cacheFile := filepath.Join(t.TempDir(), "tsok", "update-check")
+	config := autoUpdateConfig{
+		cacheFile:      cacheFile,
+		currentVersion: "v0.1.2",
+		now:            func() time.Time { return now },
+		update: func(_ context.Context, out io.Writer) error {
+			updateCalls++
+			_, _ = io.WriteString(out, "Updated tsok from v0.1.2 to v0.1.3\n")
+			return nil
+		},
+	}
+
+	var output bytes.Buffer
+	runAutoUpdate(t.Context(), config, &output)
+	if updateCalls != 1 {
+		t.Fatalf("update calls = %d, want 1", updateCalls)
+	}
+	if output.String() != "Updated tsok from v0.1.2 to v0.1.3\n" {
+		t.Fatalf("output = %q", output.String())
+	}
+
+	now = now.Add(23 * time.Hour)
+	runAutoUpdate(t.Context(), config, io.Discard)
+	if updateCalls != 1 {
+		t.Fatalf("update calls within interval = %d, want 1", updateCalls)
+	}
+
+	now = now.Add(time.Hour)
+	runAutoUpdate(t.Context(), config, io.Discard)
+	if updateCalls != 2 {
+		t.Fatalf("update calls after interval = %d, want 2", updateCalls)
+	}
+}
+
+func TestRunAutoUpdateSkipsDevelopmentBuildsAndOptOut(t *testing.T) {
+	updateCalls := 0
+	config := autoUpdateConfig{
+		cacheFile:      filepath.Join(t.TempDir(), "update-check"),
+		currentVersion: "v0.0.0-devel",
+		now:            time.Now,
+		update: func(context.Context, io.Writer) error {
+			updateCalls++
+			return nil
+		},
+	}
+	t.Setenv("TSOK_NO_AUTO_UPDATE", "")
+	runAutoUpdate(t.Context(), config, io.Discard)
+
+	config.currentVersion = "v0.1.2"
+	t.Setenv("TSOK_NO_AUTO_UPDATE", "1")
+	runAutoUpdate(t.Context(), config, io.Discard)
+	if updateCalls != 0 {
+		t.Fatalf("update calls = %d, want 0", updateCalls)
+	}
+}
+
+func TestRunAutoUpdateFailureDoesNotRepeatImmediately(t *testing.T) {
+	t.Setenv("TSOK_NO_AUTO_UPDATE", "")
+	updateCalls := 0
+	config := autoUpdateConfig{
+		cacheFile:      filepath.Join(t.TempDir(), "update-check"),
+		currentVersion: "v0.1.2",
+		now:            time.Now,
+		update: func(context.Context, io.Writer) error {
+			updateCalls++
+			return errors.New("network unavailable")
+		},
+	}
+	runAutoUpdate(t.Context(), config, io.Discard)
+	runAutoUpdate(t.Context(), config, io.Discard)
+	if updateCalls != 1 {
+		t.Fatalf("update calls = %d, want 1", updateCalls)
 	}
 }
 

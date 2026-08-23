@@ -15,14 +15,17 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
 
 	"github.com/coder/serpent"
 )
 
 const (
-	latestReleaseURL = "https://api.github.com/repos/changhoon-sung/tsok/releases/latest"
-	maxArchiveSize   = 128 << 20
-	maxChecksumSize  = 1 << 20
+	latestReleaseURL  = "https://api.github.com/repos/changhoon-sung/tsok/releases/latest"
+	maxArchiveSize    = 128 << 20
+	maxChecksumSize   = 1 << 20
+	autoUpdatePeriod  = 24 * time.Hour
+	autoUpdateTimeout = 15 * time.Second
 )
 
 type releaseAsset struct {
@@ -40,18 +43,106 @@ func updateCmd() *serpent.Command {
 		Use:   "update",
 		Short: "Update tsok to the latest release.",
 		Handler: func(inv *serpent.Invocation) error {
-			executable, err := os.Executable()
-			if err != nil {
-				return fmt.Errorf("locate current executable: %w", err)
-			}
-			executable, err = filepath.EvalSymlinks(executable)
-			if err != nil {
-				return fmt.Errorf("resolve current executable: %w", err)
-			}
-			return updateExecutable(inv.Context(), http.DefaultClient, latestReleaseURL, executable, runtime.GOOS, runtime.GOARCH, getBuildInfo().version, inv.Stdout)
+			return updateCurrentExecutable(inv.Context(), getBuildInfo().version, inv.Stdout)
 		},
 		Options: serpent.OptionSet{},
 	}
+}
+
+func updateCurrentExecutable(ctx context.Context, currentVersion string, out io.Writer) error {
+	executable, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("locate current executable: %w", err)
+	}
+	executable, err = filepath.EvalSymlinks(executable)
+	if err != nil {
+		return fmt.Errorf("resolve current executable: %w", err)
+	}
+	return updateExecutable(ctx, http.DefaultClient, latestReleaseURL, executable, runtime.GOOS, runtime.GOARCH, currentVersion, out)
+}
+
+type autoUpdateConfig struct {
+	cacheFile      string
+	currentVersion string
+	now            func() time.Time
+	update         func(context.Context, io.Writer) error
+}
+
+func withAutoUpdate(command *serpent.Command) *serpent.Command {
+	middleware := autoUpdateMiddleware(defaultAutoUpdateConfig())
+	if command.Middleware == nil {
+		command.Middleware = middleware
+	} else {
+		command.Middleware = serpent.Chain(middleware, command.Middleware)
+	}
+	return command
+}
+
+func defaultAutoUpdateConfig() autoUpdateConfig {
+	config := autoUpdateConfig{
+		currentVersion: getBuildInfo().version,
+		now:            time.Now,
+		update: func(ctx context.Context, out io.Writer) error {
+			return updateCurrentExecutable(ctx, getBuildInfo().version, out)
+		},
+	}
+	if cacheDir, err := os.UserCacheDir(); err == nil {
+		config.cacheFile = filepath.Join(cacheDir, "tsok", "update-check")
+	}
+	return config
+}
+
+func autoUpdateMiddleware(config autoUpdateConfig) serpent.MiddlewareFunc {
+	return func(next serpent.HandlerFunc) serpent.HandlerFunc {
+		return func(inv *serpent.Invocation) error {
+			var output strings.Builder
+			runAutoUpdate(inv.Context(), config, &output)
+			if inv.Stderr != nil && strings.HasPrefix(output.String(), "Updated ") {
+				_, _ = io.WriteString(inv.Stderr, output.String())
+			}
+			return next(inv)
+		}
+	}
+}
+
+func runAutoUpdate(ctx context.Context, config autoUpdateConfig, out io.Writer) {
+	if config.cacheFile == "" || config.now == nil || config.update == nil || isDevelopmentVersion(config.currentVersion) || os.Getenv("TSOK_NO_AUTO_UPDATE") != "" {
+		return
+	}
+	now := config.now()
+	if !autoUpdateDue(config.cacheFile, now) {
+		return
+	}
+	if err := recordAutoUpdateCheck(config.cacheFile, now); err != nil {
+		return
+	}
+	updateCtx, cancel := context.WithTimeout(ctx, autoUpdateTimeout)
+	defer cancel()
+	_ = config.update(updateCtx, out)
+}
+
+func autoUpdateDue(path string, now time.Time) bool {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return true
+	}
+	checkedAt, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(string(data)))
+	if err != nil {
+		return true
+	}
+	return !now.Before(checkedAt.Add(autoUpdatePeriod))
+}
+
+func recordAutoUpdateCheck(path string, now time.Time) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		return err
+	}
+	return os.WriteFile(path, []byte(now.Format(time.RFC3339Nano)+"\n"), 0600)
+}
+
+func isDevelopmentVersion(value string) bool {
+	value = normalizeVersion(value)
+	return value == "" || value == "dev" || strings.Contains(value, "devel")
 }
 
 func updateExecutable(ctx context.Context, client *http.Client, releaseURL, executable, goos, goarch, currentVersion string, out io.Writer) error {

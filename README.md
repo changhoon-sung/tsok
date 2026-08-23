@@ -32,7 +32,7 @@ Your auth key is:
     >  <auth-key>
 Use this key to authenticate other tsok commands to this instance.
 
-Connect with system OpenSSH:
+Connect with SSH:
 TSOK_AUTH_KEY=<auth-key> ssh -o 'ProxyCommand=tsok forward --tcp-stdio %p --quiet' coder@tsok
 
 Or add this block to ~/.ssh/config:

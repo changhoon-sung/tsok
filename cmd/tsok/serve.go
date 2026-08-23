@@ -368,8 +368,8 @@ func serveConnectionHelp(authKey, username string, forwardEnabled bool) string {
 
 %s
 `,
-		cliui.Bold("Connect with system OpenSSH:"),
-		command,
+		cliui.Bold("Connect with SSH:"),
+		cliui.ConfigBlock(command),
 		cliui.Bold("Or add this block to ~/.ssh/config:"),
 		cliui.ConfigBlock(configBlock),
 	)

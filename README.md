@@ -160,9 +160,8 @@ Tailscale DERP otherwise.
 
 ## Compatibility
 
-tsok is an independent project derived from
-[`coder/wush`](https://github.com/coder/wush). It is not backward-compatible
-with wush. Do not mix their binaries, auth keys, or configuration.
+tsok is not backward-compatible with wush. Do not mix their binaries, auth
+keys, or configuration.
 
 ## Build from source
 
@@ -186,3 +185,11 @@ make release-builds
 tsok is released under [Apache License 2.0](LICENSE). Third-party components
 retain their respective licenses. Run `tsok licenses` to locate the dependency
 report for the exact commit used to build the CLI.
+
+## Acknowledgements
+
+Inspired by [`coder/wush`](https://github.com/coder/wush).
+
+Thanks to the wush,
+[Tailscale](https://tailscale.com), and [WireGuard](https://www.wireguard.com)
+projects and their contributors.

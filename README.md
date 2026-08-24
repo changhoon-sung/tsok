@@ -181,18 +181,6 @@ make darwin
 make release-builds
 ```
 
-The release matrix is:
-
-```text
-tsok_linux_amd64.tar.gz
-tsok_linux_arm64.tar.gz
-tsok_darwin_amd64.tar.gz
-tsok_darwin_arm64.tar.gz
-```
-
-Every archive contains one executable named `tsok`. Run `make test` to execute
-the test suite with the race detector.
-
 ## License
 
 tsok is released under [Apache License 2.0](LICENSE). Third-party components

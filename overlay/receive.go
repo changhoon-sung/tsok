@@ -27,15 +27,45 @@ import (
 )
 
 func NewReceiveOverlay(logger *slog.Logger, hlog Logf, dm *tailcfg.DERPMap) *Receive {
+	return newReceiveOverlay(logger, hlog, dm, ReceiveState{
+		ReceiverPrivateKey: key.NewNode(),
+		OverlayPrivateKey:  key.NewNode(),
+	})
+}
+
+type ReceiveState struct {
+	ReceiverPrivateKey key.NodePrivate
+	OverlayPrivateKey  key.NodePrivate
+	DERPRegionID       uint16
+}
+
+func NewReceiveOverlayWithState(logger *slog.Logger, hlog Logf, dm *tailcfg.DERPMap, state ReceiveState) (*Receive, error) {
+	if state.ReceiverPrivateKey.IsZero() {
+		return nil, errors.New("receiver private key is zero")
+	}
+	if state.OverlayPrivateKey.IsZero() {
+		return nil, errors.New("overlay private key is zero")
+	}
+	if state.DERPRegionID == 0 {
+		return nil, errors.New("DERP region ID is zero")
+	}
+	if dm == nil || dm.Regions[int(state.DERPRegionID)] == nil {
+		return nil, fmt.Errorf("DERP region %d from persistent auth state is unavailable", state.DERPRegionID)
+	}
+	return newReceiveOverlay(logger, hlog, dm, state), nil
+}
+
+func newReceiveOverlay(logger *slog.Logger, hlog Logf, dm *tailcfg.DERPMap, state ReceiveState) *Receive {
 	return &Receive{
-		Logger:    logger,
-		HumanLogf: hlog,
-		DerpMap:   dm,
-		SelfPriv:  key.NewNode(),
-		PeerPriv:  key.NewNode(),
-		peers:     make(map[string]receivePeer),
-		in:        make(chan PeerUpdate, 8),
-		out:       make(chan *overlayMessage, 8),
+		Logger:       logger,
+		HumanLogf:    hlog,
+		DerpMap:      dm,
+		SelfPriv:     state.ReceiverPrivateKey,
+		PeerPriv:     state.OverlayPrivateKey,
+		derpRegionID: state.DERPRegionID,
+		peers:        make(map[string]receivePeer),
+		in:           make(chan PeerUpdate, 8),
+		out:          make(chan *overlayMessage, 8),
 	}
 }
 
@@ -154,6 +184,14 @@ func (r *Receive) ClientAuth() *ClientAuth {
 		OverlayPrivateKey:    r.PeerPriv,
 		ReceiverPublicKey:    r.SelfPriv.Public(),
 		ReceiverDERPRegionID: r.derpRegionID,
+	}
+}
+
+func (r *Receive) State() ReceiveState {
+	return ReceiveState{
+		ReceiverPrivateKey: r.SelfPriv,
+		OverlayPrivateKey:  r.PeerPriv,
+		DERPRegionID:       r.derpRegionID,
 	}
 }
 

@@ -26,6 +26,7 @@ import (
 
 	"github.com/changhoon-sung/tsok/cliui"
 	transportcore "github.com/changhoon-sung/tsok/internal/transport"
+	"github.com/changhoon-sung/tsok/overlay"
 	"github.com/changhoon-sung/tsok/xssh"
 	"github.com/coder/pretty"
 	"github.com/coder/serpent"
@@ -33,10 +34,13 @@ import (
 
 func serveCmd() *serpent.Command {
 	var (
-		verbose   bool
-		enabled   = []string{}
-		disabled  = []string{}
-		derpmapFi string
+		verbose       bool
+		enabled       = []string{}
+		disabled      = []string{}
+		derpmapFi     string
+		persist       bool
+		persistFile   string
+		rotateAuthKey bool
 
 		dm *tailcfg.DERPMap
 	)
@@ -49,6 +53,10 @@ func serveCmd() *serpent.Command {
 		Handler: func(inv *serpent.Invocation) error {
 			ctx, ctxCancel := inv.SignalNotifyContext(inv.Context(), os.Interrupt)
 			defer ctxCancel()
+			persistPath, err := resolvePersistFile(persist, persistFile, rotateAuthKey)
+			if err != nil {
+				return err
+			}
 			humanLog := serveHumanLog{out: inv.Stderr, now: time.Now}
 			plainf := func(format string, args ...any) {
 				fmt.Fprintf(inv.Stderr, format+"\n", args...)
@@ -74,17 +82,47 @@ func serveCmd() *serpent.Command {
 				}
 			}
 
+			var authState *overlay.ReceiveState
+			stateLoaded := false
+			if persistPath != "" && !rotateAuthKey {
+				state, found, err := loadPersistedAuthState(persistPath)
+				if err != nil {
+					return err
+				}
+				if found {
+					authState = &state
+					stateLoaded = true
+				}
+			}
+
 			host, err := transportcore.StartHost(ctx, transportcore.HostOptions{
 				CommonOptions: transportcore.CommonOptions{
 					DERPMap: dm, Logger: logger, Logf: humanLog.info,
 					Verbose: verbose, LogWriter: inv.Stderr,
 				},
 				UDPHandler: udpHandler,
+				AuthState:  authState,
 			})
 			if err != nil {
 				return err
 			}
 			defer host.Close()
+			if persistPath != "" {
+				switch {
+				case stateLoaded:
+					humanLog.info("Reusing persistent auth state from %s", persistPath)
+				case rotateAuthKey:
+					if err := savePersistedAuthState(persistPath, host.AuthState(), true); err != nil {
+						return err
+					}
+					humanLog.info("Rotated persistent auth state at %s", persistPath)
+				default:
+					if err := savePersistedAuthState(persistPath, host.AuthState(), false); err != nil {
+						return err
+					}
+					humanLog.info("Created persistent auth state at %s", persistPath)
+				}
+			}
 
 			authKey := host.AuthKey()
 
@@ -193,6 +231,24 @@ func serveCmd() *serpent.Command {
 				Description: "File which specifies the DERP config to use. In the structure of https://pkg.go.dev/tailscale.com/tailcfg#DERPMap.",
 				Default:     "",
 				Value:       serpent.StringOf(&derpmapFi),
+			},
+			{
+				Flag:        "persist",
+				Description: "Reuse the auth key from the standard per-user state file.",
+				Default:     "false",
+				Value:       serpent.BoolOf(&persist),
+			},
+			{
+				Flag:        "persist-file",
+				Description: "Reuse the auth key from a specific persistent state file.",
+				Default:     "",
+				Value:       serpent.StringOf(&persistFile),
+			},
+			{
+				Flag:        "rotate-auth-key",
+				Description: "Replace the persistent auth state with a newly generated key.",
+				Default:     "false",
+				Value:       serpent.BoolOf(&rotateAuthKey),
 			},
 		},
 	}

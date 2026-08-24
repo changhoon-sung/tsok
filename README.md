@@ -3,13 +3,15 @@
 **Temporary sockets over tsnet.**
 
 `tsok` is a CLI for creating temporary, authenticated TCP and UDP connections
-between two machines. One machine runs `tsok serve`; clients holding its auth
+between two machines.
+
+One machine runs `tsok serve`; clients holding its auth
 key can open shells, copy files, or reach services on the host's loopback
 interface.
 
-Application traffic uses an encrypted WireGuard connection. tsok attempts a
+Application traffic uses an **encrypted WireGuard connection**. tsok attempts a
 direct peer-to-peer path and falls back to Tailscale's public DERP relays when
-direct connectivity is unavailable. No Tailscale account is required.
+direct connectivity is unavailable. **No Tailscale account is required.**
 
 ## Install
 
@@ -33,21 +35,6 @@ Update an installed binary to the latest release:
 ```bash
 tsok update
 ```
-
-The updater downloads the same platform archive as the installer, verifies it
-against the release SHA-256 checksums, and atomically replaces the current
-executable. The running process finishes normally; the new version is used on
-the next invocation. The executable's directory must be writable by the
-current user.
-
-The `serve`, `shell`, `cp`, and `forward` commands also perform this update as
-a best-effort check at most once every 24 hours. Download or validation failures
-never block the requested command. When an update is installed, tsok replaces
-the current process with the new binary and restarts the same command with its
-original arguments and environment. If that restart fails, the command exits
-with an error instead of continuing in the old process. Set
-`TSOK_NO_AUTO_UPDATE=1` to disable automatic updates; `tsok update` remains
-available for an explicit update.
 
 ## Quick start
 
@@ -89,15 +76,6 @@ TSOK_AUTH_KEY=<auth-key> tsok forward --tcp 3000:8080
 
 # Forward host UDP port 53 to client port 5353.
 TSOK_AUTH_KEY=<auth-key> tsok forward --udp 5353:53
-```
-
-If an SSH server is listening on the host's loopback port 22, saving the
-generated config block enables the system OpenSSH client and tools built on it:
-
-```bash
-ssh tsok
-scp report.txt tsok:/tmp/
-rsync -av ./project/ tsok:/tmp/project/
 ```
 
 ## Commands
@@ -170,15 +148,15 @@ connection-count limit.
 ```mermaid
 flowchart LR
   CLI["shell / cp / forward"] --> CLIENT["client transport"]
-  CLIENT <-->|"encrypted bootstrap and control"| DERP["DERP"]
-  DERP <--> HOST["host transport"]
+  CLIENT <-->|"encrypted bootstrap and control"| TAILSCALE\nDERP
+  TAILSCALE\nDERP <--> HOST["host transport"]
   CLIENT <-->|"WireGuard data: direct or DERP fallback"| HOST
   HOST --> SERVICES["shell, file receiver, host loopback"]
 ```
 
-DERP bootstraps the peers and carries small control messages. Application data
+Tailscale DERP bootstraps the peers and carries small control messages. Application data
 travels through WireGuard, directly when NAT traversal succeeds and through
-DERP otherwise.
+Tailscale DERP otherwise.
 
 ## Compatibility
 

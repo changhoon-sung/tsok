@@ -119,6 +119,36 @@ destinations always use the host's loopback interface.
 `--tcp-stdio` creates no local listener. It is intended for OpenSSH
 `ProxyCommand` and other clients that can communicate over stdin/stdout.
 
+## Persistent auth keys
+
+By default, `tsok serve` creates a new temporary auth key each time it starts.
+Opt in to reusing one auth key across restarts with:
+
+```bash
+tsok serve --persist
+```
+
+On Linux this stores the server identity under `$XDG_STATE_HOME/tsok`, falling
+back to `$HOME/.local/state/tsok`. On macOS it uses the user's Application
+Support directory. For a service or custom location, select the state file
+explicitly:
+
+```bash
+tsok serve --persist-file "$HOME/.local/state/tsok/work-serve-state"
+```
+
+Rotate the key explicitly with either persistence mode:
+
+```bash
+tsok serve --persist --rotate-auth-key
+tsok serve --persist-file "$HOME/.local/state/tsok/work-serve-state" --rotate-auth-key
+```
+
+The state file contains bearer credentials. tsok creates it atomically with
+mode `0600`, refuses files accessible by group or other users, and fails rather
+than silently generating a new key when persisted state is invalid. Keep the
+file private and back it up only as a secret.
+
 ## Security model
 
 The auth key is a bearer credential. By default, anyone holding it can:

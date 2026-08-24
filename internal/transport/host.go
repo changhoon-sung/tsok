@@ -20,6 +20,7 @@ type UDPHandler func(ctx context.Context, conn net.Conn, port uint16)
 type HostOptions struct {
 	CommonOptions
 	UDPHandler UDPHandler
+	AuthState  *overlay.ReceiveState
 }
 
 type udpPort struct {
@@ -55,9 +56,16 @@ func StartHost(ctx context.Context, opts HostOptions) (_ *Host, err error) {
 		}
 	}()
 
-	h.receive = overlay.NewReceiveOverlay(opts.Logger, overlay.Logf(opts.Logf), opts.DERPMap)
-	if err := h.receive.PickDERPHome(hostCtx); err != nil {
-		return nil, err
+	if opts.AuthState == nil {
+		h.receive = overlay.NewReceiveOverlay(opts.Logger, overlay.Logf(opts.Logf), opts.DERPMap)
+		if err := h.receive.PickDERPHome(hostCtx); err != nil {
+			return nil, err
+		}
+	} else {
+		h.receive, err = overlay.NewReceiveOverlayWithState(opts.Logger, overlay.Logf(opts.Logf), opts.DERPMap, *opts.AuthState)
+		if err != nil {
+			return nil, err
+		}
 	}
 	h.receive.SetOpenUDPHandler(h.openUDP)
 	h.receive.SetSessionClosedHandler(h.closeUDPSession)
@@ -95,6 +103,8 @@ func StartHost(ctx context.Context, opts HostOptions) (_ *Host, err error) {
 }
 
 func (h *Host) AuthKey() string { return h.receive.ClientAuth().AuthKey() }
+
+func (h *Host) AuthState() overlay.ReceiveState { return h.receive.State() }
 
 func (h *Host) Listen(network, address string) (net.Listener, error) {
 	return h.ts.Listen(network, address)

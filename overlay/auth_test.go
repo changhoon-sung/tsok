@@ -194,3 +194,62 @@ func TestClientAuthPrintDebugUnknownDERPRegion(t *testing.T) {
 		t.Fatalf("debug output = %q, want unknown DERP region", output.String())
 	}
 }
+
+func TestReceiveStateReusesAuthKey(t *testing.T) {
+	t.Parallel()
+
+	dm := &tailcfg.DERPMap{Regions: map[int]*tailcfg.DERPRegion{
+		21: {RegionID: 21, RegionCode: "test", RegionName: "Test"},
+	}}
+	state := ReceiveState{
+		ReceiverPrivateKey: key.NewNode(),
+		OverlayPrivateKey:  key.NewNode(),
+		DERPRegionID:       21,
+	}
+	receiver, err := NewReceiveOverlayWithState(nil, nil, dm, state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := receiver.State(); !reflect.DeepEqual(got, state) {
+		t.Fatalf("receive state = %#v, want %#v", got, state)
+	}
+	wantAuth := (&ClientAuth{
+		OverlayPrivateKey:    state.OverlayPrivateKey,
+		ReceiverPublicKey:    state.ReceiverPrivateKey.Public(),
+		ReceiverDERPRegionID: state.DERPRegionID,
+	}).AuthKey()
+	if got := receiver.ClientAuth().AuthKey(); got != wantAuth {
+		t.Fatalf("auth key = %q, want %q", got, wantAuth)
+	}
+}
+
+func TestReceiveStateRejectsInvalidState(t *testing.T) {
+	t.Parallel()
+
+	dm := &tailcfg.DERPMap{Regions: map[int]*tailcfg.DERPRegion{
+		21: {RegionID: 21},
+	}}
+	valid := ReceiveState{
+		ReceiverPrivateKey: key.NewNode(),
+		OverlayPrivateKey:  key.NewNode(),
+		DERPRegionID:       21,
+	}
+	for _, tc := range []struct {
+		name  string
+		state ReceiveState
+		want  string
+	}{
+		{name: "zero receiver", state: ReceiveState{OverlayPrivateKey: valid.OverlayPrivateKey, DERPRegionID: 21}, want: "receiver private key is zero"},
+		{name: "zero overlay", state: ReceiveState{ReceiverPrivateKey: valid.ReceiverPrivateKey, DERPRegionID: 21}, want: "overlay private key is zero"},
+		{name: "zero region", state: ReceiveState{ReceiverPrivateKey: valid.ReceiverPrivateKey, OverlayPrivateKey: valid.OverlayPrivateKey}, want: "DERP region ID is zero"},
+		{name: "missing region", state: ReceiveState{ReceiverPrivateKey: valid.ReceiverPrivateKey, OverlayPrivateKey: valid.OverlayPrivateKey, DERPRegionID: 22}, want: "DERP region 22"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			_, err := NewReceiveOverlayWithState(nil, nil, dm, tc.state)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("error = %v, want containing %q", err, tc.want)
+			}
+		})
+	}
+}

@@ -37,7 +37,7 @@ nfpms:
     description: |-
       Wush installer package.
       Wush creates secure WireGuard tunnels between two devices.
-    license: CC0-1.0
+    license: Apache-2.0
     contents:
       - src: LICENSE
         dst: "/usr/share/doc/{{ .ProjectName }}/copyright"

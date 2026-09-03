@@ -3,8 +3,10 @@ package transport
 import (
 	"context"
 	"net"
+	"net/netip"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestUDPListenerLeaseIsSharedAcrossSessions(t *testing.T) {
@@ -56,6 +58,52 @@ func TestUDPListenerRequestFailsWhenDisabled(t *testing.T) {
 	if err := host.openUDP("session-a", 53); err == nil || err.Error() != "UDP forwarding is disabled" {
 		t.Fatalf("openUDP error = %v", err)
 	}
+}
+
+func TestSessionCloseClosesOnlyMatchingTCPConnections(t *testing.T) {
+	t.Parallel()
+
+	host := &Host{
+		tcpConns: make(map[netip.Addr]map[net.Conn]struct{}),
+		tcpPeers: make(map[netip.Addr]struct{}),
+	}
+	closedIP := netip.MustParseAddr("fd7a:115c:a1e0::2")
+	activeIP := netip.MustParseAddr("fd7a:115c:a1e0::3")
+	closedConn, closedPeer := net.Pipe()
+	activeConn, activePeer := net.Pipe()
+	t.Cleanup(func() {
+		_ = closedPeer.Close()
+		_ = activeConn.Close()
+		_ = activePeer.Close()
+	})
+	host.updateSession("session-a", []netip.Addr{closedIP})
+	host.updateSession("session-b", []netip.Addr{activeIP})
+	if !host.trackTCPConn(closedIP, closedConn) || !host.trackTCPConn(activeIP, activeConn) {
+		t.Fatal("active peer connection was rejected")
+	}
+
+	host.closeSession("session-a", []netip.Addr{closedIP})
+
+	_ = closedPeer.SetReadDeadline(time.Now().Add(time.Second))
+	if _, err := closedPeer.Read(make([]byte, 1)); err == nil {
+		t.Fatal("peer connection remained open after its overlay session closed")
+	}
+	host.tcpMu.Lock()
+	_, closedTracked := host.tcpConns[closedIP]
+	_, activeTracked := host.tcpConns[activeIP]
+	host.tcpMu.Unlock()
+	if closedTracked {
+		t.Fatal("closed peer remains in TCP connection registry")
+	}
+	if !activeTracked {
+		t.Fatal("unrelated active peer was removed from TCP connection registry")
+	}
+	lateConn, latePeer := net.Pipe()
+	defer latePeer.Close()
+	if host.trackTCPConn(closedIP, lateConn) {
+		t.Fatal("connection from a closed peer was accepted")
+	}
+	_ = lateConn.Close()
 }
 
 type blockingListener struct {

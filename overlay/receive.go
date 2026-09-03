@@ -81,6 +81,7 @@ type peerSource struct {
 type receivePeer struct {
 	source   peerSource
 	lastSeen time.Time
+	ips      []netip.Addr
 }
 
 type derpPeer struct {
@@ -108,9 +109,10 @@ type Receive struct {
 	peers    map[string]receivePeer
 	reapOnce sync.Once
 
-	handlerMu            sync.RWMutex
-	openUDPHandler       func(sessionID string, port uint16) error
-	sessionClosedHandler func(sessionID string)
+	handlerMu             sync.RWMutex
+	openUDPHandler        func(sessionID string, port uint16) error
+	sessionUpdatedHandler func(sessionID string, peerIPs []netip.Addr)
+	sessionClosedHandler  func(sessionID string, peerIPs []netip.Addr)
 	// in funnels node updates from other peers to us
 	in chan PeerUpdate
 	// out fans out our node updates to peers
@@ -123,18 +125,33 @@ func (r *Receive) SetOpenUDPHandler(handler func(sessionID string, port uint16) 
 	r.handlerMu.Unlock()
 }
 
-func (r *Receive) SetSessionClosedHandler(handler func(sessionID string)) {
+func (r *Receive) SetSessionClosedHandler(handler func(sessionID string, peerIPs []netip.Addr)) {
 	r.handlerMu.Lock()
 	r.sessionClosedHandler = handler
 	r.handlerMu.Unlock()
 }
 
-func (r *Receive) notifySessionClosed(sessionID string) {
+func (r *Receive) SetSessionUpdatedHandler(handler func(sessionID string, peerIPs []netip.Addr)) {
+	r.handlerMu.Lock()
+	r.sessionUpdatedHandler = handler
+	r.handlerMu.Unlock()
+}
+
+func (r *Receive) notifySessionUpdated(sessionID string, peerIPs []netip.Addr) {
+	r.handlerMu.RLock()
+	handler := r.sessionUpdatedHandler
+	r.handlerMu.RUnlock()
+	if handler != nil {
+		handler(sessionID, append([]netip.Addr(nil), peerIPs...))
+	}
+}
+
+func (r *Receive) notifySessionClosed(sessionID string, peerIPs []netip.Addr) {
 	r.handlerMu.RLock()
 	handler := r.sessionClosedHandler
 	r.handlerMu.RUnlock()
 	if handler != nil {
-		handler(sessionID)
+		handler(sessionID, append([]netip.Addr(nil), peerIPs...))
 	}
 }
 
@@ -283,12 +300,12 @@ func (r *Receive) handleNextMessage(source peerSource, msg []byte, system string
 	if err != nil {
 		return nil, fmt.Errorf("unmarshal overlay message: %w", err)
 	}
-	removed, err := r.trackPeer(ovMsg.SessionID, source, ovMsg.Typ, time.Now())
+	removed, peerIPs, err := r.trackPeer(ovMsg.SessionID, source, ovMsg.Typ, time.Now())
 	if err != nil {
 		return nil, err
 	}
 	if removed {
-		r.notifySessionClosed(ovMsg.SessionID)
+		r.notifySessionClosed(ovMsg.SessionID, peerIPs)
 		return nil, nil
 	}
 
@@ -315,6 +332,7 @@ func (r *Receive) handleNextMessage(source peerSource, msg []byte, system string
 		r.HumanLogf("Received connection request over %s from %s", system, cliui.Keyword(fmt.Sprintf("%s@%s", username, hostname)))
 	case messageTypeNodeUpdate:
 		r.Logger.Debug("received updated node", slog.String("node_key", ovMsg.Node.Key.String()))
+		r.setPeerIPs(ovMsg.SessionID, ovMsg.Node.Addresses)
 		r.in <- PeerUpdate{ID: ovMsg.SessionID, Node: ovMsg.Node.Clone()}
 		res.Typ = messageTypeNodeUpdate
 		if lastNode := r.lastNode.Load(); lastNode != nil {
@@ -360,35 +378,56 @@ func (r *Receive) handleNextMessage(source peerSource, msg []byte, system string
 	return sealed, nil
 }
 
-func (r *Receive) trackPeer(sessionID string, source peerSource, typ messageType, now time.Time) (bool, error) {
+func (r *Receive) trackPeer(sessionID string, source peerSource, typ messageType, now time.Time) (bool, []netip.Addr, error) {
 	if sessionID == "" {
-		return false, errors.New("overlay session ID is empty")
+		return false, nil, errors.New("overlay session ID is empty")
 	}
 	if source.derpKey.IsZero() {
-		return false, errors.New("overlay DERP peer key is empty")
+		return false, nil, errors.New("overlay DERP peer key is empty")
 	}
 	r.peerMu.Lock()
 	if r.peers == nil {
 		r.peers = make(map[string]receivePeer)
 	}
-	_, exists := r.peers[sessionID]
+	peer, exists := r.peers[sessionID]
 	if typ == messageTypeGoodbye {
 		if exists {
 			delete(r.peers, sessionID)
 			r.in <- PeerUpdate{ID: sessionID}
 		}
 		r.peerMu.Unlock()
-		return true, nil
+		return true, append([]netip.Addr(nil), peer.ips...), nil
 	}
 	if !exists {
 		if typ != messageTypeHello {
 			r.peerMu.Unlock()
-			return false, errors.New("first overlay message must be hello")
+			return false, nil, errors.New("first overlay message must be hello")
 		}
 	}
-	r.peers[sessionID] = receivePeer{source: source, lastSeen: now}
+	peer.source = source
+	peer.lastSeen = now
+	r.peers[sessionID] = peer
 	r.peerMu.Unlock()
-	return false, nil
+	return false, nil, nil
+}
+
+func (r *Receive) setPeerIPs(sessionID string, prefixes []netip.Prefix) {
+	peerIPs := make([]netip.Addr, 0, len(prefixes))
+	for _, prefix := range prefixes {
+		if addr := prefix.Addr(); addr.IsValid() {
+			peerIPs = append(peerIPs, addr)
+		}
+	}
+	r.peerMu.Lock()
+	peer, ok := r.peers[sessionID]
+	if ok {
+		peer.ips = peerIPs
+		r.peers[sessionID] = peer
+	}
+	r.peerMu.Unlock()
+	if ok {
+		r.notifySessionUpdated(sessionID, peerIPs)
+	}
 }
 
 func (r *Receive) derpPeers() []derpPeer {
@@ -402,35 +441,35 @@ func (r *Receive) derpPeers() []derpPeer {
 }
 
 func (r *Receive) removeDERPPeers(peerKey key.NodePublic) {
-	var removed []string
+	removed := make(map[string][]netip.Addr)
 	r.peerMu.Lock()
 	for sessionID, peer := range r.peers {
 		if peer.source.derpKey == peerKey {
 			delete(r.peers, sessionID)
 			r.in <- PeerUpdate{ID: sessionID}
-			removed = append(removed, sessionID)
+			removed[sessionID] = append([]netip.Addr(nil), peer.ips...)
 		}
 	}
 	r.peerMu.Unlock()
-	for _, sessionID := range removed {
-		r.notifySessionClosed(sessionID)
+	for sessionID, peerIPs := range removed {
+		r.notifySessionClosed(sessionID, peerIPs)
 	}
 }
 
 func (r *Receive) expirePeers(now time.Time) {
 	cutoff := now.Add(-peerInactiveTimeout)
-	var removed []string
+	removed := make(map[string][]netip.Addr)
 	r.peerMu.Lock()
 	for sessionID, peer := range r.peers {
 		if !peer.lastSeen.After(cutoff) {
 			delete(r.peers, sessionID)
 			r.in <- PeerUpdate{ID: sessionID}
-			removed = append(removed, sessionID)
+			removed[sessionID] = append([]netip.Addr(nil), peer.ips...)
 		}
 	}
 	r.peerMu.Unlock()
-	for _, sessionID := range removed {
-		r.notifySessionClosed(sessionID)
+	for sessionID, peerIPs := range removed {
+		r.notifySessionClosed(sessionID, peerIPs)
 	}
 }
 

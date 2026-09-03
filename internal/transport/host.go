@@ -40,7 +40,12 @@ type Host struct {
 	listenUDP  func(port uint16) (net.Listener, error)
 	udpMu      sync.Mutex
 	udpPorts   map[uint16]*udpPort
-	close      sync.Once
+	// tcpPeers gates new fallback connections, while tcpConns lets overlay
+	// session closure interrupt already-established userspace TCP flows.
+	tcpMu    sync.Mutex
+	tcpConns map[netip.Addr]map[net.Conn]struct{}
+	tcpPeers map[netip.Addr]struct{}
+	close    sync.Once
 }
 
 func StartHost(ctx context.Context, opts HostOptions) (_ *Host, err error) {
@@ -49,7 +54,11 @@ func StartHost(ctx context.Context, opts HostOptions) (_ *Host, err error) {
 		return nil, errors.New("DERP map is required")
 	}
 	hostCtx, cancel := context.WithCancel(ctx)
-	h := &Host{ctx: hostCtx, cancel: cancel, logf: opts.Logf, udpHandler: opts.UDPHandler, udpPorts: make(map[uint16]*udpPort)}
+	h := &Host{
+		ctx: hostCtx, cancel: cancel, logf: opts.Logf, udpHandler: opts.UDPHandler,
+		udpPorts: make(map[uint16]*udpPort), tcpConns: make(map[netip.Addr]map[net.Conn]struct{}),
+		tcpPeers: make(map[netip.Addr]struct{}),
+	}
 	defer func() {
 		if err != nil {
 			_ = h.Close()
@@ -68,7 +77,8 @@ func StartHost(ctx context.Context, opts HostOptions) (_ *Host, err error) {
 		}
 	}
 	h.receive.SetOpenUDPHandler(h.openUDP)
-	h.receive.SetSessionClosedHandler(h.closeUDPSession)
+	h.receive.SetSessionUpdatedHandler(h.updateSession)
+	h.receive.SetSessionClosedHandler(h.closeSession)
 
 	control, err := tsserver.NewServer(hostCtx, opts.Logger, h.receive, opts.DERPMap)
 	if err != nil {
@@ -111,7 +121,20 @@ func (h *Host) Listen(network, address string) (net.Listener, error) {
 }
 
 func (h *Host) RegisterFallbackTCPHandler(handler func(src, dst netip.AddrPort) (func(net.Conn), bool)) func() {
-	return h.ts.RegisterFallbackTCPHandler(tsnet.FallbackTCPHandler(handler))
+	return h.ts.RegisterFallbackTCPHandler(func(src, dst netip.AddrPort) (func(net.Conn), bool) {
+		connHandler, intercept := handler(src, dst)
+		if !intercept || connHandler == nil {
+			return connHandler, intercept
+		}
+		return func(conn net.Conn) {
+			if !h.trackTCPConn(src.Addr(), conn) {
+				_ = conn.Close()
+				return
+			}
+			defer h.untrackTCPConn(src.Addr(), conn)
+			connHandler(conn)
+		}, true
+	})
 }
 
 func (h *Host) LocalClient() *tailscale.LocalClient { return h.lc }
@@ -164,10 +187,87 @@ func (h *Host) closeUDPSession(sessionID string) {
 	}
 }
 
+func (h *Host) updateSession(_ string, peerIPs []netip.Addr) {
+	h.tcpMu.Lock()
+	defer h.tcpMu.Unlock()
+	if h.tcpPeers == nil {
+		h.tcpPeers = make(map[netip.Addr]struct{})
+	}
+	for _, peerIP := range peerIPs {
+		h.tcpPeers[peerIP] = struct{}{}
+	}
+}
+
+func (h *Host) trackTCPConn(peerIP netip.Addr, conn net.Conn) bool {
+	h.tcpMu.Lock()
+	defer h.tcpMu.Unlock()
+	if _, active := h.tcpPeers[peerIP]; !active {
+		return false
+	}
+	if h.tcpConns == nil {
+		h.tcpConns = make(map[netip.Addr]map[net.Conn]struct{})
+	}
+	conns := h.tcpConns[peerIP]
+	if conns == nil {
+		conns = make(map[net.Conn]struct{})
+		h.tcpConns[peerIP] = conns
+	}
+	conns[conn] = struct{}{}
+	return true
+}
+
+func (h *Host) untrackTCPConn(peerIP netip.Addr, conn net.Conn) {
+	h.tcpMu.Lock()
+	defer h.tcpMu.Unlock()
+	conns := h.tcpConns[peerIP]
+	delete(conns, conn)
+	if len(conns) == 0 {
+		delete(h.tcpConns, peerIP)
+	}
+}
+
+func (h *Host) closeTCPPeers(peerIPs []netip.Addr) {
+	var conns []net.Conn
+	h.tcpMu.Lock()
+	for _, peerIP := range peerIPs {
+		delete(h.tcpPeers, peerIP)
+		for conn := range h.tcpConns[peerIP] {
+			conns = append(conns, conn)
+		}
+		delete(h.tcpConns, peerIP)
+	}
+	h.tcpMu.Unlock()
+	for _, conn := range conns {
+		_ = conn.Close()
+	}
+}
+
+func (h *Host) closeSession(sessionID string, peerIPs []netip.Addr) {
+	h.closeUDPSession(sessionID)
+	h.closeTCPPeers(peerIPs)
+}
+
+func (h *Host) closeAllTCP() {
+	var conns []net.Conn
+	h.tcpMu.Lock()
+	for peerIP, peerConns := range h.tcpConns {
+		for conn := range peerConns {
+			conns = append(conns, conn)
+		}
+		delete(h.tcpConns, peerIP)
+	}
+	clear(h.tcpPeers)
+	h.tcpMu.Unlock()
+	for _, conn := range conns {
+		_ = conn.Close()
+	}
+}
+
 func (h *Host) Close() error {
 	var closeErr error
 	h.close.Do(func() {
 		h.cancel()
+		h.closeAllTCP()
 		h.udpMu.Lock()
 		for port, state := range h.udpPorts {
 			closeErr = errors.Join(closeErr, state.listener.Close())

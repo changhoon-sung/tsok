@@ -2,8 +2,10 @@ package transport
 
 import (
 	"context"
+	"errors"
 	"net"
 	"net/netip"
+	"os"
 	"sync"
 	"testing"
 	"time"
@@ -63,10 +65,7 @@ func TestUDPListenerRequestFailsWhenDisabled(t *testing.T) {
 func TestSessionCloseClosesOnlyMatchingTCPConnections(t *testing.T) {
 	t.Parallel()
 
-	host := &Host{
-		tcpConns: make(map[netip.Addr]map[net.Conn]struct{}),
-		tcpPeers: make(map[netip.Addr]struct{}),
-	}
+	host := newTCPTestHost()
 	closedIP := netip.MustParseAddr("fd7a:115c:a1e0::2")
 	activeIP := netip.MustParseAddr("fd7a:115c:a1e0::3")
 	closedConn, closedPeer := net.Pipe()
@@ -104,6 +103,76 @@ func TestSessionCloseClosesOnlyMatchingTCPConnections(t *testing.T) {
 		t.Fatal("connection from a closed peer was accepted")
 	}
 	_ = lateConn.Close()
+}
+
+func TestSessionUpdateReplacesPeerIPs(t *testing.T) {
+	t.Parallel()
+
+	host := newTCPTestHost()
+	oldIP := netip.MustParseAddr("fd7a:115c:a1e0::4")
+	newIP := netip.MustParseAddr("fd7a:115c:a1e0::5")
+	oldConn, oldPeer := net.Pipe()
+	defer oldPeer.Close()
+	host.updateSession("session-a", []netip.Addr{oldIP})
+	if !host.trackTCPConn(oldIP, oldConn) {
+		t.Fatal("initial peer connection was rejected")
+	}
+
+	host.updateSession("session-a", []netip.Addr{newIP})
+
+	_ = oldPeer.SetReadDeadline(time.Now().Add(time.Second))
+	if _, err := oldPeer.Read(make([]byte, 1)); err == nil {
+		t.Fatal("connection for replaced peer IP remained open")
+	}
+	lateOld, lateOldPeer := net.Pipe()
+	defer lateOldPeer.Close()
+	if host.trackTCPConn(oldIP, lateOld) {
+		t.Fatal("connection from replaced peer IP was accepted")
+	}
+	_ = lateOld.Close()
+	newConn, newPeer := net.Pipe()
+	defer newConn.Close()
+	defer newPeer.Close()
+	if !host.trackTCPConn(newIP, newConn) {
+		t.Fatal("connection from replacement peer IP was rejected")
+	}
+}
+
+func TestSessionCloseKeepsIPSharedByActiveSession(t *testing.T) {
+	t.Parallel()
+
+	host := newTCPTestHost()
+	sharedIP := netip.MustParseAddr("fd7a:115c:a1e0::6")
+	host.updateSession("session-a", []netip.Addr{sharedIP})
+	host.updateSession("session-b", []netip.Addr{sharedIP})
+	conn, peer := net.Pipe()
+	defer peer.Close()
+	if !host.trackTCPConn(sharedIP, conn) {
+		t.Fatal("shared peer connection was rejected")
+	}
+
+	host.closeSession("session-a", []netip.Addr{sharedIP})
+
+	_ = peer.SetReadDeadline(time.Now().Add(20 * time.Millisecond))
+	if _, err := peer.Read(make([]byte, 1)); err == nil {
+		t.Fatal("shared peer read unexpectedly completed")
+	} else if !errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("shared peer connection closed with %v while session-b remained active", err)
+	}
+	_ = peer.SetReadDeadline(time.Time{})
+	host.closeSession("session-b", []netip.Addr{sharedIP})
+	_ = peer.SetReadDeadline(time.Now().Add(time.Second))
+	if _, err := peer.Read(make([]byte, 1)); err == nil {
+		t.Fatal("shared peer connection remained open after its final session closed")
+	}
+}
+
+func newTCPTestHost() *Host {
+	return &Host{
+		tcpConns:        make(map[netip.Addr]map[net.Conn]struct{}),
+		tcpSessions:     make(map[string]map[netip.Addr]struct{}),
+		tcpPeerSessions: make(map[netip.Addr]map[string]struct{}),
+	}
 }
 
 type blockingListener struct {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"net/netip"
 	"strings"
 	"testing"
 	"time"
@@ -292,23 +293,46 @@ func TestSendOpenUDPCorrelatesResponse(t *testing.T) {
 	}
 }
 
-func TestReceiveNotifiesUDPLeaseOnGoodbye(t *testing.T) {
+func TestReceiveNotifiesSessionClosureOnGoodbye(t *testing.T) {
 	t.Parallel()
 
 	receive := newTestReceive()
 	source := testPeerSource()
-	closed := make(chan string, 1)
-	receive.SetSessionClosedHandler(func(sessionID string) { closed <- sessionID })
+	type closeEvent struct {
+		sessionID string
+		peerIPs   []netip.Addr
+	}
+	closed := make(chan closeEvent, 1)
+	updated := make(chan closeEvent, 1)
+	receive.SetSessionUpdatedHandler(func(sessionID string, peerIPs []netip.Addr) {
+		updated <- closeEvent{sessionID: sessionID, peerIPs: peerIPs}
+	})
+	receive.SetSessionClosedHandler(func(sessionID string, peerIPs []netip.Addr) {
+		closed <- closeEvent{sessionID: sessionID, peerIPs: peerIPs}
+	})
 	hello := sealReceiveMessage(t, receive, overlayMessage{Typ: messageTypeHello, SessionID: "session-a"})
 	if _, err := receive.handleNextMessage(source, hello, "test"); err != nil {
 		t.Fatal(err)
+	}
+	peerIP := netip.MustParseAddr("fd7a:115c:a1e0::2")
+	update := sealReceiveMessage(t, receive, overlayMessage{
+		Typ: messageTypeNodeUpdate, SessionID: "session-a",
+		Node: tailcfg.Node{ID: 1, Key: key.NewNode().Public(), Addresses: []netip.Prefix{netip.PrefixFrom(peerIP, 128)}},
+	})
+	if _, err := receive.handleNextMessage(source, update, "test"); err != nil {
+		t.Fatal(err)
+	}
+	updateEvent := <-updated
+	if updateEvent.sessionID != "session-a" || len(updateEvent.peerIPs) != 1 || updateEvent.peerIPs[0] != peerIP {
+		t.Fatalf("updated session = %#v, want session-a at %s", updateEvent, peerIP)
 	}
 	goodbye := sealReceiveMessage(t, receive, overlayMessage{Typ: messageTypeGoodbye, SessionID: "session-a"})
 	if _, err := receive.handleNextMessage(source, goodbye, "test"); err != nil {
 		t.Fatal(err)
 	}
-	if sessionID := <-closed; sessionID != "session-a" {
-		t.Fatalf("closed session = %q", sessionID)
+	event := <-closed
+	if event.sessionID != "session-a" || len(event.peerIPs) != 1 || event.peerIPs[0] != peerIP {
+		t.Fatalf("closed session = %#v, want session-a at %s", event, peerIP)
 	}
 }
 
@@ -317,8 +341,11 @@ func TestReceiveExpiresInactivePeers(t *testing.T) {
 
 	receive := newTestReceive()
 	now := time.Now()
-	receive.peers["expired"] = receivePeer{lastSeen: now.Add(-peerInactiveTimeout)}
+	peerIP := netip.MustParseAddr("fd7a:115c:a1e0::3")
+	receive.peers["expired"] = receivePeer{lastSeen: now.Add(-peerInactiveTimeout), ips: []netip.Addr{peerIP}}
 	receive.peers["active"] = receivePeer{lastSeen: now}
+	closed := make(chan []netip.Addr, 1)
+	receive.SetSessionClosedHandler(func(_ string, peerIPs []netip.Addr) { closed <- peerIPs })
 	receive.expirePeers(now)
 
 	if _, ok := receive.peers["expired"]; ok {
@@ -330,6 +357,9 @@ func TestReceiveExpiresInactivePeers(t *testing.T) {
 	update := <-receive.in
 	if update.ID != "expired" || update.Node != nil {
 		t.Fatalf("expiry update = %#v, want removal for expired", update)
+	}
+	if peerIPs := <-closed; len(peerIPs) != 1 || peerIPs[0] != peerIP {
+		t.Fatalf("expired peer IPs = %v, want [%s]", peerIPs, peerIP)
 	}
 }
 

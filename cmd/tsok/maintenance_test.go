@@ -179,6 +179,18 @@ func TestBridgeStdioCancellation(t *testing.T) {
 	}
 }
 
+func TestBridgeStdioStopsAfterStdinDrainTimeout(t *testing.T) {
+	t.Parallel()
+
+	client, server := newHalfPipe()
+	defer server.Close()
+
+	err := bridgeStdioWithDrainTimeout(context.Background(), client, strings.NewReader(""), io.Discard, 10*time.Millisecond)
+	if !errors.Is(err, errTCPStdioDrainTimeout) {
+		t.Fatalf("bridgeStdioWithDrainTimeout() error = %v, want %v", err, errTCPStdioDrainTimeout)
+	}
+}
+
 func TestServeConnectionHelp(t *testing.T) {
 	t.Parallel()
 

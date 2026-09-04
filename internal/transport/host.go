@@ -40,7 +40,13 @@ type Host struct {
 	listenUDP  func(port uint16) (net.Listener, error)
 	udpMu      sync.Mutex
 	udpPorts   map[uint16]*udpPort
-	close      sync.Once
+	// tcpPeerSessions gates new fallback connections, while tcpConns lets
+	// overlay session closure interrupt established userspace TCP flows.
+	tcpMu           sync.Mutex
+	tcpConns        map[netip.Addr]map[net.Conn]struct{}
+	tcpSessions     map[string]map[netip.Addr]struct{}
+	tcpPeerSessions map[netip.Addr]map[string]struct{}
+	close           sync.Once
 }
 
 func StartHost(ctx context.Context, opts HostOptions) (_ *Host, err error) {
@@ -49,7 +55,12 @@ func StartHost(ctx context.Context, opts HostOptions) (_ *Host, err error) {
 		return nil, errors.New("DERP map is required")
 	}
 	hostCtx, cancel := context.WithCancel(ctx)
-	h := &Host{ctx: hostCtx, cancel: cancel, logf: opts.Logf, udpHandler: opts.UDPHandler, udpPorts: make(map[uint16]*udpPort)}
+	h := &Host{
+		ctx: hostCtx, cancel: cancel, logf: opts.Logf, udpHandler: opts.UDPHandler,
+		udpPorts: make(map[uint16]*udpPort), tcpConns: make(map[netip.Addr]map[net.Conn]struct{}),
+		tcpSessions:     make(map[string]map[netip.Addr]struct{}),
+		tcpPeerSessions: make(map[netip.Addr]map[string]struct{}),
+	}
 	defer func() {
 		if err != nil {
 			_ = h.Close()
@@ -68,7 +79,8 @@ func StartHost(ctx context.Context, opts HostOptions) (_ *Host, err error) {
 		}
 	}
 	h.receive.SetOpenUDPHandler(h.openUDP)
-	h.receive.SetSessionClosedHandler(h.closeUDPSession)
+	h.receive.SetSessionUpdatedHandler(h.updateSession)
+	h.receive.SetSessionClosedHandler(h.closeSession)
 
 	control, err := tsserver.NewServer(hostCtx, opts.Logger, h.receive, opts.DERPMap)
 	if err != nil {
@@ -111,7 +123,20 @@ func (h *Host) Listen(network, address string) (net.Listener, error) {
 }
 
 func (h *Host) RegisterFallbackTCPHandler(handler func(src, dst netip.AddrPort) (func(net.Conn), bool)) func() {
-	return h.ts.RegisterFallbackTCPHandler(tsnet.FallbackTCPHandler(handler))
+	return h.ts.RegisterFallbackTCPHandler(func(src, dst netip.AddrPort) (func(net.Conn), bool) {
+		connHandler, intercept := handler(src, dst)
+		if !intercept || connHandler == nil {
+			return connHandler, intercept
+		}
+		return func(conn net.Conn) {
+			if !h.trackTCPConn(src.Addr(), conn) {
+				_ = conn.Close()
+				return
+			}
+			defer h.untrackTCPConn(src.Addr(), conn)
+			connHandler(conn)
+		}, true
+	})
 }
 
 func (h *Host) LocalClient() *tailscale.LocalClient { return h.lc }
@@ -164,10 +189,133 @@ func (h *Host) closeUDPSession(sessionID string) {
 	}
 }
 
+func (h *Host) updateSession(sessionID string, peerIPs []netip.Addr) {
+	current := make(map[netip.Addr]struct{}, len(peerIPs))
+	for _, peerIP := range peerIPs {
+		current[peerIP] = struct{}{}
+	}
+
+	var conns []net.Conn
+	h.tcpMu.Lock()
+	if h.tcpSessions == nil {
+		h.tcpSessions = make(map[string]map[netip.Addr]struct{})
+	}
+	if h.tcpPeerSessions == nil {
+		h.tcpPeerSessions = make(map[netip.Addr]map[string]struct{})
+	}
+	for peerIP := range h.tcpSessions[sessionID] {
+		if _, retained := current[peerIP]; retained {
+			continue
+		}
+		sessions := h.tcpPeerSessions[peerIP]
+		delete(sessions, sessionID)
+		if len(sessions) == 0 {
+			delete(h.tcpPeerSessions, peerIP)
+			for conn := range h.tcpConns[peerIP] {
+				conns = append(conns, conn)
+			}
+			delete(h.tcpConns, peerIP)
+		}
+	}
+	for peerIP := range current {
+		sessions := h.tcpPeerSessions[peerIP]
+		if sessions == nil {
+			sessions = make(map[string]struct{})
+			h.tcpPeerSessions[peerIP] = sessions
+		}
+		sessions[sessionID] = struct{}{}
+	}
+	h.tcpSessions[sessionID] = current
+	h.tcpMu.Unlock()
+	closeConns(conns)
+}
+
+func (h *Host) trackTCPConn(peerIP netip.Addr, conn net.Conn) bool {
+	h.tcpMu.Lock()
+	defer h.tcpMu.Unlock()
+	if len(h.tcpPeerSessions[peerIP]) == 0 {
+		return false
+	}
+	if h.tcpConns == nil {
+		h.tcpConns = make(map[netip.Addr]map[net.Conn]struct{})
+	}
+	conns := h.tcpConns[peerIP]
+	if conns == nil {
+		conns = make(map[net.Conn]struct{})
+		h.tcpConns[peerIP] = conns
+	}
+	conns[conn] = struct{}{}
+	return true
+}
+
+func (h *Host) untrackTCPConn(peerIP netip.Addr, conn net.Conn) {
+	h.tcpMu.Lock()
+	defer h.tcpMu.Unlock()
+	conns := h.tcpConns[peerIP]
+	delete(conns, conn)
+	if len(conns) == 0 {
+		delete(h.tcpConns, peerIP)
+	}
+}
+
+func (h *Host) closeTCPSession(sessionID string, peerIPs []netip.Addr) {
+	var conns []net.Conn
+	h.tcpMu.Lock()
+	peers := h.tcpSessions[sessionID]
+	for _, peerIP := range peerIPs {
+		if peers == nil {
+			peers = make(map[netip.Addr]struct{}, len(peerIPs))
+		}
+		peers[peerIP] = struct{}{}
+	}
+	for peerIP := range peers {
+		sessions := h.tcpPeerSessions[peerIP]
+		delete(sessions, sessionID)
+		if len(sessions) != 0 {
+			continue
+		}
+		delete(h.tcpPeerSessions, peerIP)
+		for conn := range h.tcpConns[peerIP] {
+			conns = append(conns, conn)
+		}
+		delete(h.tcpConns, peerIP)
+	}
+	delete(h.tcpSessions, sessionID)
+	h.tcpMu.Unlock()
+	closeConns(conns)
+}
+
+func (h *Host) closeSession(sessionID string, peerIPs []netip.Addr) {
+	h.closeUDPSession(sessionID)
+	h.closeTCPSession(sessionID, peerIPs)
+}
+
+func (h *Host) closeAllTCP() {
+	var conns []net.Conn
+	h.tcpMu.Lock()
+	for peerIP, peerConns := range h.tcpConns {
+		for conn := range peerConns {
+			conns = append(conns, conn)
+		}
+		delete(h.tcpConns, peerIP)
+	}
+	clear(h.tcpSessions)
+	clear(h.tcpPeerSessions)
+	h.tcpMu.Unlock()
+	closeConns(conns)
+}
+
+func closeConns(conns []net.Conn) {
+	for _, conn := range conns {
+		_ = conn.Close()
+	}
+}
+
 func (h *Host) Close() error {
 	var closeErr error
 	h.close.Do(func() {
 		h.cancel()
+		h.closeAllTCP()
 		h.udpMu.Lock()
 		for port, state := range h.udpPorts {
 			closeErr = errors.Join(closeErr, state.listener.Close())

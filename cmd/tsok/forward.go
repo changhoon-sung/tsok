@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"tailscale.com/tailcfg"
 
@@ -20,6 +21,12 @@ import (
 	transportcore "github.com/changhoon-sung/tsok/internal/transport"
 	"github.com/coder/serpent"
 )
+
+// Bound how long a ProxyCommand can survive after its parent closes stdin but
+// the remote side never closes its output stream.
+const tcpStdioDrainTimeout = 30 * time.Second
+
+var errTCPStdioDrainTimeout = errors.New("remote connection did not close after stdin EOF")
 
 func forwardCmd() *serpent.Command {
 	var (
@@ -277,16 +284,11 @@ func listenAndForward(
 }
 
 func bridgeStdio(ctx context.Context, conn net.Conn, stdin io.Reader, stdout io.Writer) error {
+	return bridgeStdioWithDrainTimeout(ctx, conn, stdin, stdout, tcpStdioDrainTimeout)
+}
+
+func bridgeStdioWithDrainTimeout(ctx context.Context, conn io.ReadWriteCloser, stdin io.Reader, stdout io.Writer, drainTimeout time.Duration) error {
 	defer conn.Close()
-	done := make(chan struct{})
-	defer close(done)
-	go func() {
-		select {
-		case <-ctx.Done():
-			_ = conn.Close()
-		case <-done:
-		}
-	}()
 
 	stdinErr := make(chan error, 1)
 	go func() {
@@ -302,21 +304,50 @@ func bridgeStdio(ctx context.Context, conn net.Conn, stdin io.Reader, stdout io.
 		}
 	}()
 
-	_, stdoutErr := io.Copy(stdout, conn)
-	if ctx.Err() != nil {
-		return ctx.Err()
+	stdoutErr := make(chan error, 1)
+	go func() {
+		_, err := io.Copy(stdout, conn)
+		stdoutErr <- err
+	}()
+
+	finishStdout := func(err error) error {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		select {
+		case stdinCopyErr := <-stdinErr:
+			if stdinCopyErr != nil {
+				return fmt.Errorf("copy stdin to remote connection: %w", stdinCopyErr)
+			}
+		default:
+		}
+		if err != nil {
+			return fmt.Errorf("copy remote connection to stdout: %w", err)
+		}
+		return nil
 	}
+
 	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case err := <-stdoutErr:
+		return finishStdout(err)
 	case err := <-stdinErr:
 		if err != nil {
 			return fmt.Errorf("copy stdin to remote connection: %w", err)
 		}
-	default:
 	}
-	if stdoutErr != nil {
-		return fmt.Errorf("copy remote connection to stdout: %w", stdoutErr)
+
+	timer := time.NewTimer(drainTimeout)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case err := <-stdoutErr:
+		return finishStdout(err)
+	case <-timer.C:
+		return errTCPStdioDrainTimeout
 	}
-	return nil
 }
 
 func copyDatagrams(ctx context.Context, left, right net.Conn) {

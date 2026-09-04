@@ -1,5 +1,7 @@
 # tsok
 
+# ⚠️ Deprecated. See [tailcat](https://github.com/tailscale/tailcat)
+
 **Temporary sockets over tsnet.**
 
 `tsok` is a CLI for creating temporary, authenticated TCP and UDP connections
